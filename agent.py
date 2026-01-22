@@ -162,8 +162,14 @@ def main():
 
     for source_name, url in SOURCES:
         print(f"[INFO] Fetching: {source_name} ({url})")
-        text = fetch_text(url)
-        candidates = extract_candidates(text)
+try:
+    text = fetch_text(url)
+except Exception as e:
+    print(f"[WARN] Failed to fetch {url}: {repr(e)}")
+    new_items_by_source[source_name] = []
+    continue
+
+candidates = extract_candidates(text)
 
         new_items = []
         for c in candidates:
