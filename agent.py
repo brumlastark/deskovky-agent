@@ -101,6 +101,7 @@ def build_digest(new_items_by_source):
 def send_email(subject, body):
     import smtplib
     from email.mime.text import MIMEText
+    from email.utils import make_msgid
 
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
@@ -116,6 +117,7 @@ def send_email(subject, body):
     msg["Subject"] = subject
     msg["From"] = mail_from
     msg["To"] = mail_to
+    msg["Message-ID"] = make_msgid()   # ← TOHLE JE TEN FIX
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
         s.set_debuglevel(1)
