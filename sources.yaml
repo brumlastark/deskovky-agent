@@ -1,0 +1,158 @@
+sources:
+  # === CZ (priorita: nižší číslo = vyšší priorita při shodě titulu) ===
+  - id: tlama_novinky
+    label: TLAMA – Novinky v češtině
+    kind: cz
+    priority: 10
+    urls:
+      - https://www.tlamagames.com/novinky-v-cestine/
+    allow_domains: ["www.tlamagames.com"]
+    product_url_must_contain: ["/deskove-hry/"]
+    product_url_must_not_contain:
+      - "/registrace"
+      - "/klient/"
+      - "/kosik"
+      - "/obchodni-"
+      - "/podminky"
+      - "/doprava_"
+      - "/affiliate"
+      - "/action/language"
+      - "/deskove-hry/encyklopedie"
+      - "/deskove-hry/deskove-hry"
+
+  - id: tlama_predprodej
+    label: TLAMA – Předprodej
+    kind: cz
+    priority: 9
+    urls:
+      - https://www.tlamagames.com/predprodej/
+    allow_domains: ["www.tlamagames.com"]
+    product_url_must_contain: ["/deskove-hry/"]
+    product_url_must_not_contain:
+      - "/registrace"
+      - "/klient/"
+      - "/kosik"
+      - "/obchodni-"
+      - "/podminky"
+      - "/doprava_"
+      - "/affiliate"
+      - "/action/language"
+      - "/deskove-hry/encyklopedie"
+      - "/deskove-hry/deskove-hry"
+
+  - id: rexhry_katalog
+    label: Rexhry – Katalog (nejnovější)
+    kind: cz
+    priority: 30
+    urls:
+      - https://www.rexhry.cz/katalog
+    allow_domains: ["www.rexhry.cz"]
+    product_url_must_contain_any:
+      - "/katalog/"
+      - "/produkt/"
+      - "/hra/"
+      - "/hry/"
+    product_url_must_not_contain:
+      - "/katalog?":
+      - "/pripravujeme"
+
+  - id: rexhry_pripravujeme
+    label: Rexhry – Připravujeme
+    kind: cz
+    priority: 31
+    urls:
+      - https://www.rexhry.cz/pripravujeme
+    allow_domains: ["www.rexhry.cz"]
+    product_url_must_contain_any:
+      - "/katalog/"
+      - "/produkt/"
+      - "/hra/"
+      - "/hry/"
+
+  - id: albi_hry
+    label: Albi – Hry
+    kind: cz
+    priority: 40
+    urls:
+      - https://albi.cz/hry/
+    allow_domains: ["albi.cz", "www.albi.cz"]
+    product_url_must_contain_any:
+      - "/hry/"
+    product_url_must_not_contain:
+      - "/edicni-plan"
+
+  - id: albi_edicni_plan
+    label: Albi – Ediční plán
+    kind: cz
+    priority: 41
+    urls:
+      - https://albi.cz/cteni-pro-radost/edicni-plan-her-albi/
+    allow_domains: ["albi.cz", "www.albi.cz"]
+    product_url_must_contain_any:
+      - "/hry/"
+      - "/produkt/"
+      - "/produkt-detail/"
+
+  - id: asmodee_katalog
+    label: Asmodee CZ – Katalog
+    kind: cz
+    priority: 50
+    urls:
+      - https://www.asmodee.cz/katalog-her/
+    allow_domains: ["www.asmodee.cz"]
+    product_url_must_contain_any:
+      - "/katalog-her/"
+      - "/hra/"
+      - "/hry/"
+    product_url_must_not_contain:
+      - "/pripravujeme/"
+
+  - id: asmodee_pripravujeme
+    label: Asmodee CZ – Připravujeme
+    kind: cz
+    priority: 51
+    urls:
+      - https://www.asmodee.cz/pripravujeme/
+    allow_domains: ["www.asmodee.cz"]
+    product_url_must_contain_any:
+      - "/katalog-her/"
+      - "/hra/"
+      - "/hry/"
+
+  - id: mindok_nase_hry
+    label: MindOK – Naše hry (nejnovější)
+    kind: cz
+    priority: 60
+    urls:
+      - https://mindok.cz/nase-hry/
+    allow_domains: ["mindok.cz", "www.mindok.cz"]
+    product_url_must_contain_any:
+      - "/hry/"
+      - "/nase-hry/"
+      - "/hra/"
+
+  - id: mindok_pripravujeme
+    label: MindOK – Připravujeme
+    kind: cz
+    priority: 61
+    urls:
+      - https://mindok.cz/hry/pripravujeme/
+    allow_domains: ["mindok.cz", "www.mindok.cz"]
+    product_url_must_contain_any:
+      - "/hry/"
+      - "/nase-hry/"
+      - "/hra/"
+
+  # === Crowdfunding ===
+  - id: kickstarter_tabletop
+    label: Kickstarter – Tabletop Games
+    kind: crowdfunding
+    priority: 200
+    urls:
+      - https://www.kickstarter.com/discover/categories/games/tabletop%20games
+    allow_domains: ["www.kickstarter.com"]
+    product_url_must_contain: ["/projects/"]
+    product_url_must_not_contain:
+      - "/discover/"
+      - "/login"
+      - "/signup"
