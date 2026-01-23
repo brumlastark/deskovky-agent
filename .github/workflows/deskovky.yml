@@ -30,5 +30,6 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
           python agent.py
