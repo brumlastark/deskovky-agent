@@ -1,4 +1,6 @@
-# agent.py (v4) — TLAMA + Kolekce + Skupina + AI "fit index" (Top 3)
+# agent.py (v4.1) — TLAMA + Kolekce + Skupina + AI "fit index" (Top 3)
+# Fix: TOP tipy se už nezobrazují podruhé v seznamu "Nové hry (TLAMA)".
+
 import os
 import re
 import csv
@@ -30,15 +32,14 @@ TLAMA_URL = "https://www.tlamagames.com/novinky-v-cestine/"
 TLAMA_BASE = "https://www.tlamagames.com"
 
 # === AI SETTINGS ===
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # levnější default
-AI_SCORE_LIMIT = int(os.environ.get("AI_SCORE_LIMIT", "8"))  # kolik her týdně bodovat AI (kvůli ceně)
-AI_TOP_N = int(os.environ.get("AI_TOP_N", "3"))              # kolik tipů ukázat nahoře
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+AI_SCORE_LIMIT = int(os.environ.get("AI_SCORE_LIMIT", "8"))  # how many games to score (cost control)
+AI_TOP_N = int(os.environ.get("AI_TOP_N", "3"))              # how many top tips to show
 
 
 # === TLAMA product URL filter ===
 PRODUCT_PATH_PREFIXES = ["/deskove-hry/"]
 
-# keywords suggesting expansion
 EXPANSION_KEYWORDS = [
     "rozšíření", "rozsireni", "expanze", "expansion", "extension",
     "doplněk", "doplnok", "dodatek", "promo", "promo pack",
@@ -53,25 +54,22 @@ TITLE_BLACKLIST_CONTAINS = [
     "tel:", "facebook", "instagram",
 ]
 
-# exact blacklist by title (normalized)
 TITLE_BLACKLIST_EXACT = {
     "deskové hry", "deskove hry",
 }
 
-# path blacklist (stable)
 PATH_BLACKLIST_CONTAINS = [
     "/registrace", "/klient/", "/kosik", "/doprava_", "/obchodni-", "/podminky",
     "/prosenior", "/prorodinu", "/prozkusenehrace", "/strategicke-hry", "/hrypro",
     "/3-6let", "/7-12let", "/13-let", "/proholky", "/prokluky",
     "/tipy", "/sleva", "/akce", "/festival", "/deskovcon",
     "/action/language", "/affiliate_",
-    # your “stinkers”
+    # stinkers (stable)
     "/deskove-hry/encyklopedie",
     "/deskove-hry/deskove-hry",
 ]
 
 
-# === helpers ===
 def norm(s: str) -> str:
     s = (s or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
@@ -124,7 +122,6 @@ def is_product_url(url: str) -> bool:
     if any(norm(b) in path_low for b in PATH_BLACKLIST_CONTAINS):
         return False
 
-    # listing itself is not a product
     if norm(path).rstrip("/") == "/deskove-hry":
         return False
 
@@ -185,7 +182,6 @@ def extract_tlama_products(html_text: str) -> list[dict]:
 
         items_by_url[url] = {"title": text, "url": url, "image_url": img_url}
 
-    # de-dup by normalized title
     out, seen = [], set()
     for it in items_by_url.values():
         nt = norm(it["title"])
@@ -197,7 +193,7 @@ def extract_tlama_products(html_text: str) -> list[dict]:
 
 
 def load_csv_rows(csv_url: str) -> list[list[str]]:
-    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/4.0"})
+    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/4.1"})
     r.raise_for_status()
     raw = r.text.lstrip("\ufeff")
     reader = csv.reader(io.StringIO(raw))
@@ -232,12 +228,6 @@ def load_collection_titles(csv_url: str) -> list[str]:
 
 
 def load_group_profile(csv_url: str) -> tuple[dict, dict]:
-    """
-    Expects header: Kdo | Popis
-    Returns: (people_profiles, meta)
-      people_profiles: {"Honza": "...", "Káťa": "...", ...}
-      meta: {"players": "4", "avoid_dice_heavy": "yes", ...}
-    """
     rows = load_csv_rows(csv_url)
     if not rows:
         return {}, {}
@@ -261,7 +251,6 @@ def load_group_profile(csv_url: str) -> tuple[dict, dict]:
             continue
         popis = row[popis_idx].strip() if popis_idx < len(row) else ""
 
-        # heuristic: meta keys often include underscores OR are known meta keys
         k_norm = norm(kdo)
         if "_" in k_norm or k_norm in {"players", "avoid_dice_heavy", "session_length"}:
             meta[k_norm] = popis.strip() if popis else ""
@@ -285,7 +274,6 @@ def match_expansion_to_owned(title: str, owned_norm_titles: list[str]) -> str | 
 def extract_game_blurb_from_product_page(product_html: str) -> str:
     soup = BeautifulSoup(product_html, "html.parser")
 
-    # try meta descriptions first
     og = soup.find("meta", attrs={"property": "og:description"})
     if og and og.get("content"):
         return " ".join(og["content"].split())
@@ -294,17 +282,14 @@ def extract_game_blurb_from_product_page(product_html: str) -> str:
     if desc and desc.get("content"):
         return " ".join(desc["content"].split())
 
-    # fallback: try a short chunk of visible text
     text = soup.get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text)
-    # take a sane slice
     return text[:600]
 
 
 def summarize_group_for_prompt(people: dict, meta: dict) -> str:
     parts = []
     if meta:
-        # keep it short & explicit for the model
         if meta.get("players"):
             parts.append(f"- Typicky hráčů: {meta.get('players')}")
         if meta.get("avoid_dice_heavy"):
@@ -327,10 +312,6 @@ def summarize_group_for_prompt(people: dict, meta: dict) -> str:
 
 
 def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: str) -> dict:
-    """
-    Returns dict:
-      {"fit": int 0-100, "why": [..], "m_note": str, "s_note": str, "warnings": [..]}
-    """
     instructions = (
         "Jsi kurátor deskovek pro jednu konkrétní skupinu. "
         "Dostaneš profil skupiny a krátký popis hry. "
@@ -358,13 +339,11 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
 
     resp = client.responses.create(
         model=OPENAI_MODEL,
-        reasoning={"effort": "low"},
         instructions=instructions,
         input=input_payload,
     )
 
     raw = (resp.output_text or "").strip()
-    # attempt to parse JSON even if model wraps it
     try:
         data = json.loads(raw)
     except Exception:
@@ -373,10 +352,8 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
             return {"fit": 0, "why": ["AI odpověď nešla přečíst."], "m_note": "", "s_note": "", "warnings": ["formát AI outputu mimo JSON"]}
         data = json.loads(m.group(0))
 
-    # sanitize
-    fit = data.get("fit", 0)
     try:
-        fit = int(fit)
+        fit = int(data.get("fit", 0))
     except Exception:
         fit = 0
     fit = max(0, min(100, fit))
@@ -415,13 +392,12 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
 
     # === AI scoring (Top N) ===
     top_block = []
-    scored = []
     if os.environ.get("OPENAI_API_KEY"):
         client = OpenAI()
         group_text = summarize_group_for_prompt(people, meta)
 
-        # score only first AI_SCORE_LIMIT games (cost control)
         candidates = new_games[:AI_SCORE_LIMIT]
+        scored = []
         for it in candidates:
             try:
                 product_html = fetch(it["url"])
@@ -438,6 +414,10 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
         for it, score in top:
             top_block.append({"item": it, "score": score})
 
+    # ✅ remove TOP picks from the plain "Nové hry" list (no duplicates)
+    top_urls = {t["item"]["url"] for t in top_block} if top_block else set()
+    new_games_rest = [it for it in new_games if it["url"] not in top_urls]
+
     # === Plain text ===
     lines = []
     lines.append(f"🎲 Deskovkový briefing – {date.today().isoformat()}")
@@ -445,7 +425,8 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
     if top_block:
         lines.append("🏆 TOP tipy týdne (AI fit pro skupinu):")
         for t in top_block:
-            it = t["item"]; sc = t["score"]
+            it = t["item"]
+            sc = t["score"]
             lines.append(f"- {sc['fit']}/100 — {it['title']}")
             for w in sc.get("why", []):
                 lines.append(f"  • {w}")
@@ -467,11 +448,11 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
     lines.append("")
 
     lines.append("🆕 Nové hry (TLAMA):")
-    if new_games:
-        for it in new_games:
+    if new_games_rest:
+        for it in new_games_rest:
             lines.append(f"- {it['title']} — {it['url']}")
     else:
-        lines.append("- (zatím nic)")
+        lines.append("- (zbytek tento týden pokryl TOP výběr 🙂)")
     text_body = "\n".join(lines)
 
     # === HTML ===
@@ -481,6 +462,7 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
         img = it.get("image_url") or ""
         img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:10px;display:block;">' if img else ""
         left = f'<div style="flex:0 0 64px;">{img_tag}</div>' if img_tag else ""
+        extra = extra_html or ""
         return f"""
         <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #2a2a2a;">
           {left}
@@ -488,7 +470,7 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
             <div style="font-size:15px;line-height:1.3;margin:0 0 4px 0;">
               <a href="{u}" style="color:#8ab4f8;text-decoration:none;">{t}</a>
             </div>
-            {extra_html}
+            {extra}
             <div style="font-size:12px;color:#9aa0a6;word-break:break-all;">{u}</div>
           </div>
         </div>
@@ -498,14 +480,18 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
     if top_block:
         blocks = []
         for t in top_block:
-            it = t["item"]; sc = t["score"]
+            it = t["item"]
+            sc = t["score"]
             why = sc.get("why", [])
             m_note = sc.get("m_note", "")
             s_note = sc.get("s_note", "")
             warnings = sc.get("warnings", [])
 
-            parts = [f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;">'
-                     f'<b>{sc["fit"]}/100</b> — {html.escape(" • ".join(why))}</div>']
+            parts = []
+            if why:
+                parts.append(f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;"><b>{sc["fit"]}/100</b> — {html.escape(" • ".join(why))}</div>')
+            else:
+                parts.append(f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;"><b>{sc["fit"]}/100</b></div>')
 
             notes = []
             if m_note:
@@ -526,7 +512,7 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
         """ + "".join(blocks)
 
     exp_html = "".join(card(it) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(zatím nic jasného)</div>'
-    games_html = "".join(card(it) for it in new_games) or '<div style="color:#9aa0a6;">(zatím nic)</div>'
+    games_html = "".join(card(it) for it in new_games_rest) or '<div style="color:#9aa0a6;">(zbytek tento týden pokryl TOP výběr 🙂)</div>'
 
     html_body = f"""
     <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#e8eaed;background:#121212;padding:18px;">
@@ -583,24 +569,19 @@ def send_email(subject: str, text_body: str, html_body: str):
 
 
 def main():
-    # minimal required env
     required = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
         raise RuntimeError(f"Missing env vars: {missing}")
 
-    # load inputs
     owned = load_collection_titles(COLLECTION_CSV_URL)
     people, meta = load_group_profile(GROUP_CSV_URL)
 
     tlama_html = fetch(TLAMA_URL)
     items = extract_tlama_products(tlama_html)
 
-    # build mail
     text_body, html_body = build_email(owned, items, people, meta)
 
-    # dynamic subject
-    # (we don't parse counts from HTML, just do quick heuristics here)
     subject = f"Deskovkový briefing – {date.today().isoformat()}"
     if os.environ.get("OPENAI_API_KEY"):
         subject = f"Deskovkový briefing – TOP {AI_TOP_N} tipy (AI) ({date.today().isoformat()})"
