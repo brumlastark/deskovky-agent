@@ -1,4 +1,4 @@
-# agent.py (v2)
+# agent.py (v3) — čistší výstup: jen hry + rozšíření k tvé kolekci
 import os
 import re
 import csv
@@ -6,6 +6,7 @@ import io
 import html
 import unicodedata
 from datetime import date
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,61 +17,72 @@ SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTmHPN69oIL7Fit
 
 # === ZDROJ NOVINEK (zatím TLAMA) ===
 TLAMA_URL = "https://www.tlamagames.com/novinky-v-cestine/"
+TLAMA_BASE = "https://www.tlamagames.com"
+
+# Na TLAMA považujeme za "produkty" jen URL v tomto tvaru:
+PRODUCT_PATH_PREFIXES = [
+    "/deskove-hry/",      # produkty
+    # pokud by TLAMA používala i jiné, můžeš přidat sem
+    # "/deskovky/",
+]
 
 # Slova, která typicky značí rozšíření (CZ/EN)
 EXPANSION_KEYWORDS = [
     "rozšíření", "rozsireni", "expanze", "expansion", "extension",
     "doplněk", "doplnok", "dodatek", "promo", "promo pack",
-    "balíček", "balicek", "pack", "packy",
+    "balíček", "balicek", "pack",
 ]
 
-# řádky, které nechceme brát jako hry
-LINE_BLACKLIST = {
-    "nastavení", "souhlasím", "přejít na obsah", "prihlasit se", "přihlásit se",
-    "nová registrace", "zákaznická podpora", "kontakt", "gdpr", "cookies",
-    "menu", "vyhledávání", "vyhledavani", "košík", "kosik",
-}
+# Titulky/odkazy, které nechceme nikdy
+TITLE_BLACKLIST_CONTAINS = [
+    "registrace", "zapomenuté heslo", "přihlásit", "prihlasit", "košík", "kosik",
+    "doprava", "platba", "obchodní podmínky", "podmínky", "ochrany osobních údajů",
+    "gdpr", "cookies", "věrnostní", "affiliate", "program", "kontakt", "půjčovna",
+    "provozní řád", "rozcesnik", "čestina", "english", "language",
+    "tel:", "facebook", "instagram",
+]
+
+# nechceme “kategorie”
+PATH_BLACKLIST_CONTAINS = [
+    "/registrace", "/klient/", "/kosik", "/doprava_", "/obchodni-", "/podminky",
+    "/prosenior", "/prorodinu", "/prozkusenehrace", "/strategicke-hry", "/hrypro",
+    "/3-6let", "/7-12let", "/13-let", "/proholky", "/prokluky",
+    "/tipy", "/sleva", "/akce", "/festival", "/deskovcon",
+    "/action/language", "/affiliate_",
+]
 
 
 def norm(s: str) -> str:
     """Normalize text for matching: lowercase, strip, remove diacritics, collapse spaces."""
     s = (s or "").strip().lower()
-    # remove diacritics
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    # collapse whitespace
     s = re.sub(r"\s+", " ", s)
     return s
 
 
 def looks_like_expansion(title: str) -> bool:
     t = norm(title)
-    return any(k in t for k in EXPANSION_KEYWORDS)
+    return any(norm(k) in t for k in EXPANSION_KEYWORDS)
 
 
 def load_collection_titles(csv_url: str) -> list[str]:
-    """Loads user's collection from Google Sheet CSV, expects column A header 'Titul'."""
-    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/2.0"})
+    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/3.0"})
     r.raise_for_status()
-
-    # CSV can contain BOM; handle robustly
     raw = r.text.lstrip("\ufeff")
     f = io.StringIO(raw)
     reader = csv.reader(f)
-
     rows = list(reader)
     if not rows:
         return []
 
     header = rows[0]
-    # find column named "Titul" (case-insensitive)
     col_idx = None
     for i, h in enumerate(header):
         if norm(h) == "titul":
             col_idx = i
             break
     if col_idx is None:
-        # fallback: first column
         col_idx = 0
 
     titles = []
@@ -80,7 +92,6 @@ def load_collection_titles(csv_url: str) -> list[str]:
             if t:
                 titles.append(t)
 
-    # de-dup, keep order
     seen = set()
     out = []
     for t in titles:
@@ -104,6 +115,7 @@ def fetch_html(url: str) -> str:
 def absolute_url(base: str, href: str) -> str:
     if not href:
         return ""
+    href = href.strip()
     if href.startswith("http://") or href.startswith("https://"):
         return href
     if href.startswith("//"):
@@ -113,76 +125,108 @@ def absolute_url(base: str, href: str) -> str:
     return base.rstrip("/") + "/" + href
 
 
-def extract_tlama_items(html_text: str) -> list[dict]:
+def is_product_url(url: str) -> bool:
+    """Keep only real product pages, not categories/utility pages."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if "tlamagames.com" not in p.netloc:
+        return False
+
+    path = p.path or ""
+    if not any(path.startswith(pref) for pref in PRODUCT_PATH_PREFIXES):
+        return False
+
+    # vyhoď známé nechtěné patterny
+    path_low = norm(path)
+    if any(norm(b) in path_low for b in PATH_BLACKLIST_CONTAINS):
+        return False
+
+    return True
+
+
+def title_is_ok(title: str) -> bool:
+    t = norm(title)
+    if len(t) < 4 or len(t) > 90:
+        return False
+
+    # vyhoď číselné/telefonní věci
+    if re.fullmatch(r"[\d\+\s\-\(\)]+", title.strip()):
+        return False
+
+    if any(norm(b) in t for b in TITLE_BLACKLIST_CONTAINS):
+        return False
+
+    return True
+
+
+def extract_image_url(img_tag, base: str) -> str:
+    if not img_tag:
+        return ""
+    for attr in ["src", "data-src", "data-original", "data-lazy", "data-image"]:
+        val = img_tag.get(attr)
+        if val and isinstance(val, str) and val.strip():
+            return absolute_url(base, val.strip())
+    return ""
+
+
+def extract_tlama_products(html_text: str) -> list[dict]:
     """
-    Best-effort extraction of items (title, url, image_url) from TLAMA page.
-    Works even if structure changes slightly.
+    Extract only TLAMA product items from the "Novinky v češtině" page.
+    Strategy:
+    - iterate all <a href=...>
+    - keep only URLs that look like product pages (/deskove-hry/...)
+    - use anchor text as title (fallback: img alt)
+    - try to find image (img src/data-src in link or its parents)
     """
     soup = BeautifulSoup(html_text, "html.parser")
-
-    base = "https://www.tlamagames.com"
     items_by_url = {}
 
-    # Heuristic: product-like links are usually <a> with meaningful text and href to TLAMA
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
+        href = a.get("href", "")
+        url = absolute_url(TLAMA_BASE, href)
+        if not is_product_url(url):
+            continue
+
         text = " ".join(a.get_text(" ", strip=True).split())
 
+        # fallback: sometimes link has no text but image alt does
         if not text:
+            img_in = a.find("img")
+            if img_in and img_in.get("alt"):
+                text = " ".join(str(img_in.get("alt")).split())
+
+        if not text or not title_is_ok(text):
             continue
 
-        # quick blacklist
-        if norm(text) in LINE_BLACKLIST:
-            continue
-
-        # skip very short/very long
-        if len(text) < 4 or len(text) > 120:
-            continue
-
-        url = absolute_url(base, href)
-
-        # keep only TLAMA internal links
-        if "tlamagames.com" not in url:
-            continue
-
-        # drop obvious non-product pages
-        bad_parts = ["/customer/", "/checkout", "/account", "/login", "/search", "/kontakt", "/gdpr", "#"]
-        if any(bp in url for bp in bad_parts):
-            continue
-
-        # find an image near this link
+        # image: inside link or nearby parents
         img_url = ""
         img = a.find("img")
-        if img and img.get("src"):
-            img_url = absolute_url(base, img.get("src").strip())
-        else:
-            # try nearby images (parent container)
+        img_url = extract_image_url(img, TLAMA_BASE)
+
+        if not img_url:
             parent = a.parent
-            for _ in range(3):
+            for _ in range(4):
                 if not parent:
                     break
                 img2 = parent.find("img")
-                if img2 and img2.get("src"):
-                    img_url = absolute_url(base, img2.get("src").strip())
+                img_url = extract_image_url(img2, TLAMA_BASE)
+                if img_url:
                     break
                 parent = parent.parent
 
-        # store
-        if url not in items_by_url:
-            items_by_url[url] = {
-                "title": text,
-                "url": url,
-                "image_url": img_url,
-            }
+        items_by_url[url] = {
+            "title": text,
+            "url": url,
+            "image_url": img_url,
+        }
 
-    # lightly clean: remove duplicates by normalized title where URL differs
-    seen_titles = set()
+    # de-dup by normalized title (keep first)
     out = []
+    seen_titles = set()
     for it in items_by_url.values():
         nt = norm(it["title"])
-        # filter out obvious UI leftovers
-        if any(bad in nt for bad in ["tlamagames", "novinky v cestine", "lednovy vyprodej", "nejprodavanejsi"]):
-            continue
         if nt in seen_titles:
             continue
         seen_titles.add(nt)
@@ -192,13 +236,8 @@ def extract_tlama_items(html_text: str) -> list[dict]:
 
 
 def match_expansion_to_owned(title: str, owned_norm_titles: list[str]) -> str | None:
-    """
-    Returns matched owned game title (normalized string) if expansion seems to reference it.
-    Simple substring match.
-    """
     t = norm(title)
     for game_nt in owned_norm_titles:
-        # require a minimum length to avoid silly matches (e.g., "go")
         if len(game_nt) < 4:
             continue
         if game_nt in t:
@@ -210,7 +249,7 @@ def build_email_html(owned_titles: list[str], items: list[dict]) -> tuple[str, s
     owned_norm = [norm(t) for t in owned_titles]
 
     expansions_for_owned = []
-    other_items = []
+    new_games = []
 
     for it in items:
         title = it["title"]
@@ -218,31 +257,35 @@ def build_email_html(owned_titles: list[str], items: list[dict]) -> tuple[str, s
             match = match_expansion_to_owned(title, owned_norm)
             if match:
                 expansions_for_owned.append(it)
-            else:
-                other_items.append(it)
+            # rozšíření mimo kolekci nechceme (podle tvého zadání)
         else:
-            other_items.append(it)
+            new_games.append(it)
 
-    # Plain-text fallback
+    # omez počty do mailu (briefing, ne katalog)
+    expansions_for_owned = expansions_for_owned[:10]
+    new_games = new_games[:12]
+
+    # Plain text fallback
     lines = []
     lines.append(f"🎲 Deskovkový briefing – {date.today().isoformat()}")
     lines.append("")
-    lines.append("Ahoj! Tady je výlov z TLAMA (novinky v češtině).")
+    lines.append("Ahoj! M už plánuje škodění, Š kontroluje, jestli někde nečíhají kostky.")
     lines.append("")
 
+    lines.append("🧩 Rozšíření pro hry, které už máš:")
     if expansions_for_owned:
-        lines.append("🧩 Rozšíření pro hry, které už máš:")
-        for it in expansions_for_owned[:20]:
+        for it in expansions_for_owned:
             lines.append(f"- {it['title']} — {it['url']}")
-        lines.append("")
     else:
-        lines.append("🧩 Rozšíření pro tvoje hry: (zatím nic jasného)")
-        lines.append("")
+        lines.append("- (zatím nic jasného)")
+    lines.append("")
 
-    lines.append("🆕 Ostatní novinky / hry:")
-    for it in other_items[:30]:
-        lines.append(f"- {it['title']} — {it['url']}")
-
+    lines.append("🆕 Nové hry (TLAMA):")
+    if new_games:
+        for it in new_games:
+            lines.append(f"- {it['title']} — {it['url']}")
+    else:
+        lines.append("- (zatím nic)")
     text_body = "\n".join(lines)
 
     # HTML body
@@ -251,21 +294,23 @@ def build_email_html(owned_titles: list[str], items: list[dict]) -> tuple[str, s
         u = html.escape(it["url"])
         img = it.get("image_url") or ""
         if img:
-            img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:8px;display:block;">'
+            img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:10px;display:block;">'
         else:
-            img_tag = '<div style="width:64px;height:64px;border-radius:8px;background:#2a2a2a;"></div>'
+            img_tag = '<div style="width:64px;height:64px;border-radius:10px;background:#2a2a2a;"></div>'
         return f"""
         <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #2a2a2a;">
           <div style="flex:0 0 64px;">{img_tag}</div>
           <div style="flex:1 1 auto;">
-            <div style="font-size:15px;line-height:1.3;margin:0 0 4px 0;"><a href="{u}" style="color:#8ab4f8;text-decoration:none;">{t}</a></div>
+            <div style="font-size:15px;line-height:1.3;margin:0 0 4px 0;">
+              <a href="{u}" style="color:#8ab4f8;text-decoration:none;">{t}</a>
+            </div>
             <div style="font-size:12px;color:#9aa0a6;word-break:break-all;">{u}</div>
           </div>
         </div>
         """
 
-    exp_html = "".join(card(it) for it in expansions_for_owned[:20]) or '<div style="color:#9aa0a6;">(zatím nic jasného)</div>'
-    other_html = "".join(card(it) for it in other_items[:30]) or '<div style="color:#9aa0a6;">(nic)</div>'
+    exp_html = "".join(card(it) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(zatím nic jasného)</div>'
+    games_html = "".join(card(it) for it in new_games) or '<div style="color:#9aa0a6;">(zatím nic)</div>'
 
     html_body = f"""
     <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#e8eaed;background:#121212;padding:18px;">
@@ -277,11 +322,11 @@ def build_email_html(owned_titles: list[str], items: list[dict]) -> tuple[str, s
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🧩 Rozšíření pro hry, které už máš</h2>
       {exp_html}
 
-      <h2 style="font-size:16px;margin:18px 0 8px 0;">🆕 Ostatní novinky / hry (TLAMA)</h2>
-      {other_html}
+      <h2 style="font-size:16px;margin:18px 0 8px 0;">🆕 Nové hry (TLAMA)</h2>
+      {games_html}
 
       <div style="margin-top:16px;color:#9aa0a6;font-size:12px;">
-        Zdroj: TLAMA “Novinky v češtině”. Zatrolené zatím blokují automatické stahování (403).
+        Zdroj: TLAMA “Novinky v češtině”. (Filtrujeme jen produktové stránky /deskove-hry/.)
       </div>
     </div>
     """.strip()
@@ -296,7 +341,7 @@ def send_email(subject: str, text_body: str, html_body: str):
     from email.utils import make_msgid
 
     smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))  # port je volitelný
     smtp_user = os.environ["SMTP_USER"]
     smtp_pass = os.environ["SMTP_PASS"]
     mail_from = os.environ["MAIL_FROM"]
@@ -320,7 +365,8 @@ def send_email(subject: str, text_body: str, html_body: str):
 
 
 def main():
-    required = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
+    # SMTP_PORT je záměrně nepovinný (fallback 587)
+    required = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
         raise RuntimeError(f"Missing env vars: {missing}")
@@ -329,8 +375,8 @@ def main():
     print(f"[INFO] Loaded collection titles: {len(owned)}")
 
     tlama_html = fetch_html(TLAMA_URL)
-    items = extract_tlama_items(tlama_html)
-    print(f"[INFO] Extracted TLAMA items: {len(items)}")
+    items = extract_tlama_products(tlama_html)
+    print(f"[INFO] Extracted TLAMA product items: {len(items)}")
 
     text_body, html_body = build_email_html(owned, items)
     subject = f"Deskovkový briefing – M škodí, Š šediví ({date.today().isoformat()})"
