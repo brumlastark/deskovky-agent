@@ -1,5 +1,8 @@
-# agent.py (v4.1) — TLAMA + Kolekce + Skupina + AI "fit index" (Top 3)
-# Fix: TOP tipy se už nezobrazují podruhé v seznamu "Nové hry (TLAMA)".
+# agent.py (v5) — CZ vydavatelé (TLAMA priorita) + Kickstarter + Kolekce + Skupina + AI TOP 3
+# - čte sources.yaml
+# - deduplikuje hry napříč zdroji (preferuje TLAMA link, když existuje)
+# - AI TOP 3 napříč všemi CZ + crowdfunding (oddělené sekce v mailu)
+# - TOP tipy se neukazují podruhé v dalších seznamech
 
 import os
 import re
@@ -8,66 +11,54 @@ import io
 import html
 import json
 import unicodedata
+from dataclasses import dataclass
 from datetime import date
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+import yaml
 
 from openai import OpenAI
 
 
-# === INPUTS ===
+# === SHEETS ===
 COLLECTION_CSV_URL = os.environ.get(
     "COLLECTION_CSV_URL",
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vTmHPN69oIL7Fit5EN_K6HXtYtEPOZi2v-KmFL85D-wQsljrIT3cDY_Uh0LShOiIDfOx6rGJPlfESa2/pub?output=csv",
 )
-
 GROUP_CSV_URL = os.environ.get(
     "GROUP_CSV_URL",
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vQsZls09kQMlBDG8kMyzb-bjIpEV9ON8zbK6a1dYS9Imp9tUcgBzQmNrFH9dtq2ySIG_afmTewJx1-1/pub?output=csv",
 )
 
-TLAMA_URL = "https://www.tlamagames.com/novinky-v-cestine/"
-TLAMA_BASE = "https://www.tlamagames.com"
+SOURCES_YAML_PATH = os.environ.get("SOURCES_YAML_PATH", "sources.yaml")
 
 # === AI SETTINGS ===
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-AI_SCORE_LIMIT = int(os.environ.get("AI_SCORE_LIMIT", "8"))  # how many games to score (cost control)
-AI_TOP_N = int(os.environ.get("AI_TOP_N", "3"))              # how many top tips to show
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+AI_SCORE_LIMIT = int(os.environ.get("AI_SCORE_LIMIT", "10"))  # kolik kandidátů skórovat AI (cost control)
+AI_TOP_N = int(os.environ.get("AI_TOP_N", "3"))
 
+# how many items to collect from each source page (hard cap)
+PER_SOURCE_ITEM_CAP = int(os.environ.get("PER_SOURCE_ITEM_CAP", "30"))
 
-# === TLAMA product URL filter ===
-PRODUCT_PATH_PREFIXES = ["/deskove-hry/"]
-
+# === expansion detection ===
 EXPANSION_KEYWORDS = [
     "rozšíření", "rozsireni", "expanze", "expansion", "extension",
     "doplněk", "doplnok", "dodatek", "promo", "promo pack",
     "balíček", "balicek", "pack",
 ]
 
+# titles we never want to show as games
 TITLE_BLACKLIST_CONTAINS = [
     "registrace", "zapomenuté heslo", "přihlásit", "prihlasit", "košík", "kosik",
     "doprava", "platba", "obchodní podmínky", "podmínky", "ochrany osobních údajů",
     "gdpr", "cookies", "věrnostní", "affiliate", "program", "kontakt", "půjčovna",
-    "provozní řád", "rozcesnik", "čestina", "english", "language",
-    "tel:", "facebook", "instagram",
+    "provozní řád", "rozcesnik", "čestina", "english", "language", "tel:",
+    "facebook", "instagram",
 ]
 
-TITLE_BLACKLIST_EXACT = {
-    "deskové hry", "deskove hry",
-}
-
-PATH_BLACKLIST_CONTAINS = [
-    "/registrace", "/klient/", "/kosik", "/doprava_", "/obchodni-", "/podminky",
-    "/prosenior", "/prorodinu", "/prozkusenehrace", "/strategicke-hry", "/hrypro",
-    "/3-6let", "/7-12let", "/13-let", "/proholky", "/prokluky",
-    "/tipy", "/sleva", "/akce", "/festival", "/deskovcon",
-    "/action/language", "/affiliate_",
-    # stinkers (stable)
-    "/deskove-hry/encyklopedie",
-    "/deskove-hry/deskove-hry",
-]
+TITLE_BLACKLIST_EXACT = {"deskové hry", "deskove hry"}
 
 
 def norm(s: str) -> str:
@@ -76,6 +67,20 @@ def norm(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def title_is_ok(title: str) -> bool:
+    t = norm(title)
+    if len(t) < 4 or len(t) > 110:
+        return False
+    if t in TITLE_BLACKLIST_EXACT:
+        return False
+    if any(norm(b) in t for b in TITLE_BLACKLIST_CONTAINS):
+        return False
+    # ignore pure price / numbers
+    if re.fullmatch(r"[\d\+\s\-\(\)\.,%]+", title.strip()):
+        return False
+    return True
 
 
 def looks_like_expansion(title: str) -> bool:
@@ -93,6 +98,14 @@ def fetch(url: str, *, timeout: int = 30) -> str:
     return r.text
 
 
+def safe_fetch(url: str, *, timeout: int = 30) -> tuple[str | None, str | None]:
+    """Returns (html, error_string)"""
+    try:
+        return fetch(url, timeout=timeout), None
+    except Exception as e:
+        return None, str(e)
+
+
 def absolute_url(base: str, href: str) -> str:
     if not href:
         return ""
@@ -106,94 +119,90 @@ def absolute_url(base: str, href: str) -> str:
     return base.rstrip("/") + "/" + href
 
 
-def is_product_url(url: str) -> bool:
-    try:
-        p = urlparse(url)
-    except Exception:
-        return False
-    if "tlamagames.com" not in p.netloc:
-        return False
+def extract_image_url(soup: BeautifulSoup, base: str) -> str:
+    # meta first (most reliable)
+    og_img = soup.find("meta", attrs={"property": "og:image"})
+    if og_img and og_img.get("content"):
+        return absolute_url(base, og_img["content"].strip())
 
-    path = p.path or ""
-    if not any(path.startswith(pref) for pref in PRODUCT_PATH_PREFIXES):
-        return False
+    tw_img = soup.find("meta", attrs={"name": "twitter:image"})
+    if tw_img and tw_img.get("content"):
+        return absolute_url(base, tw_img["content"].strip())
 
-    path_low = norm(path)
-    if any(norm(b) in path_low for b in PATH_BLACKLIST_CONTAINS):
-        return False
-
-    if norm(path).rstrip("/") == "/deskove-hry":
-        return False
-
-    return True
-
-
-def title_is_ok(title: str) -> bool:
-    t = norm(title)
-    if len(t) < 4 or len(t) > 90:
-        return False
-    if t in TITLE_BLACKLIST_EXACT:
-        return False
-    if re.fullmatch(r"[\d\+\s\-\(\)]+", title.strip()):
-        return False
-    if any(norm(b) in t for b in TITLE_BLACKLIST_CONTAINS):
-        return False
-    return True
-
-
-def extract_image_url(img_tag, base: str) -> str:
-    if not img_tag:
-        return ""
-    for attr in ["src", "data-src", "data-original", "data-lazy", "data-image"]:
-        val = img_tag.get(attr)
-        if val and isinstance(val, str) and val.strip():
-            return absolute_url(base, val.strip())
+    # fallback: first meaningful img
+    img = soup.find("img")
+    if img:
+        for attr in ["src", "data-src", "data-original", "data-lazy", "data-image"]:
+            v = img.get(attr)
+            if v and isinstance(v, str) and v.strip():
+                return absolute_url(base, v.strip())
     return ""
 
 
-def extract_tlama_products(html_text: str) -> list[dict]:
-    soup = BeautifulSoup(html_text, "html.parser")
-    items_by_url = {}
+def extract_title_from_page(soup: BeautifulSoup) -> str:
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        return " ".join(og_title["content"].split()).strip()
 
-    for a in soup.find_all("a", href=True):
-        url = absolute_url(TLAMA_BASE, a.get("href", ""))
-        if not is_product_url(url):
+    h1 = soup.find("h1")
+    if h1:
+        t = " ".join(h1.get_text(" ", strip=True).split()).strip()
+        if t:
+            return t
+
+    if soup.title and soup.title.string:
+        return " ".join(str(soup.title.string).split()).strip()
+
+    return ""
+
+
+def extract_blurb_from_page(soup: BeautifulSoup) -> str:
+    og = soup.find("meta", attrs={"property": "og:description"})
+    if og and og.get("content"):
+        return " ".join(og["content"].split())[:700]
+
+    desc = soup.find("meta", attrs={"name": "description"})
+    if desc and desc.get("content"):
+        return " ".join(desc["content"].split())[:700]
+
+    text = soup.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+    return text[:700]
+
+
+def is_jsonld_product(soup: BeautifulSoup) -> bool:
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.get_text(strip=True) or "{}")
+        except Exception:
             continue
 
-        text = " ".join(a.get_text(" ", strip=True).split())
-        if not text:
-            img_in = a.find("img")
-            if img_in and img_in.get("alt"):
-                text = " ".join(str(img_in.get("alt")).split())
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get("@type")
+            if isinstance(t, list):
+                t = " ".join(t)
+            if isinstance(t, str) and "Product" in t:
+                return True
+    return False
 
-        if not text or not title_is_ok(text):
-            continue
 
-        img_url = extract_image_url(a.find("img"), TLAMA_BASE)
-        if not img_url:
-            parent = a.parent
-            for _ in range(4):
-                if not parent:
-                    break
-                img_url = extract_image_url(parent.find("img"), TLAMA_BASE)
-                if img_url:
-                    break
-                parent = parent.parent
-
-        items_by_url[url] = {"title": text, "url": url, "image_url": img_url}
-
-    out, seen = [], set()
-    for it in items_by_url.values():
-        nt = norm(it["title"])
-        if nt in seen:
-            continue
-        seen.add(nt)
-        out.append(it)
-    return out
+@dataclass
+class Item:
+    title: str
+    url: str
+    image_url: str
+    source_id: str
+    source_label: str
+    kind: str               # "cz" or "crowdfunding"
+    priority: int
+    blurb: str = ""         # short text from product page
 
 
 def load_csv_rows(csv_url: str) -> list[list[str]]:
-    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/4.1"})
+    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/5.0"})
     r.raise_for_status()
     raw = r.text.lstrip("\ufeff")
     reader = csv.reader(io.StringIO(raw))
@@ -261,46 +270,17 @@ def load_group_profile(csv_url: str) -> tuple[dict, dict]:
     return people, meta
 
 
-def match_expansion_to_owned(title: str, owned_norm_titles: list[str]) -> str | None:
-    t = norm(title)
-    for game_nt in owned_norm_titles:
-        if len(game_nt) < 4:
-            continue
-        if game_nt in t:
-            return game_nt
-    return None
-
-
-def extract_game_blurb_from_product_page(product_html: str) -> str:
-    soup = BeautifulSoup(product_html, "html.parser")
-
-    og = soup.find("meta", attrs={"property": "og:description"})
-    if og and og.get("content"):
-        return " ".join(og["content"].split())
-
-    desc = soup.find("meta", attrs={"name": "description"})
-    if desc and desc.get("content"):
-        return " ".join(desc["content"].split())
-
-    text = soup.get_text(" ", strip=True)
-    text = re.sub(r"\s+", " ", text)
-    return text[:600]
-
-
 def summarize_group_for_prompt(people: dict, meta: dict) -> str:
     parts = []
-    if meta:
-        if meta.get("players"):
-            parts.append(f"- Typicky hráčů: {meta.get('players')}")
-        if meta.get("avoid_dice_heavy"):
-            parts.append(f"- Vyhýbáme se hrám s velkým důrazem na kostky/náhodu: {meta.get('avoid_dice_heavy')}")
-        if meta.get("session_length"):
-            parts.append(f"- Délka sezení (realita): {meta.get('session_length')}")
+    if meta.get("players"):
+        parts.append(f"- Typicky hráčů: {meta.get('players')}")
+    if meta.get("avoid_dice_heavy"):
+        parts.append(f"- Vyhýbáme se hrám s velkým důrazem na kostky/náhodu: {meta.get('avoid_dice_heavy')}")
+    if meta.get("session_length"):
+        parts.append(f"- Délka sezení (realita): {meta.get('session_length')}")
     meta_block = "\n".join(parts).strip()
 
-    people_lines = []
-    for name, profile in people.items():
-        people_lines.append(f"{name}: {profile}")
+    people_lines = [f"{name}: {profile}" for name, profile in people.items()]
     people_block = "\n".join(people_lines).strip()
 
     out = []
@@ -316,10 +296,9 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "Jsi kurátor deskovek pro jednu konkrétní skupinu. "
         "Dostaneš profil skupiny a krátký popis hry. "
         "Ohodnoť, jak moc je hra fit pro skupinu (0–100). "
-        "Buď konkrétní, ale stručný. "
-        "Zvlášť přidej 1 krátkou poznámku k hráčům M (Monča) a Š (Šimon), "
-        "ideálně vtipně, ale ne cringe. "
-        "Pokud hra výrazně stojí na kostkách/náhodě, dej varování."
+        "Buď konkrétní a stručný. "
+        "Cíl: A) fit pro skupinu + 1–2 poznámky pro M (Monča) a Š (Šimon). "
+        "Pokud hra výrazně stojí na náhodě/kostkách, uveď varování."
     )
 
     input_payload = (
@@ -349,7 +328,7 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
     except Exception:
         m = re.search(r"\{.*\}", raw, flags=re.S)
         if not m:
-            return {"fit": 0, "why": ["AI odpověď nešla přečíst."], "m_note": "", "s_note": "", "warnings": ["formát AI outputu mimo JSON"]}
+            return {"fit": 0, "why": ["AI odpověď nešla přečíst."], "m_note": "", "s_note": "", "warnings": ["AI output mimo JSON"]}
         data = json.loads(m.group(0))
 
     try:
@@ -374,60 +353,219 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
     return {"fit": fit, "why": why, "m_note": m_note, "s_note": s_note, "warnings": warnings}
 
 
-def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: dict) -> tuple[str, str]:
+def load_sources_config(path: str) -> list[dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return cfg.get("sources", [])
+
+
+def url_allowed(url: str, src: dict) -> bool:
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+
+    allow_domains = set(src.get("allow_domains", []))
+    if allow_domains and p.netloc not in allow_domains:
+        return False
+
+    must_contain = src.get("product_url_must_contain", [])
+    for part in must_contain:
+        if part and part not in url:
+            return False
+
+    must_contain_any = src.get("product_url_must_contain_any", [])
+    if must_contain_any:
+        if not any(part in url for part in must_contain_any if part):
+            return False
+
+    must_not = src.get("product_url_must_not_contain", [])
+    for part in must_not:
+        if part and part in url:
+            return False
+
+    return True
+
+
+def extract_candidate_urls(listing_html: str, base_url: str, src: dict) -> list[str]:
+    soup = BeautifulSoup(listing_html, "html.parser")
+    out = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        u = absolute_url(base_url, a.get("href", ""))
+        if not u:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        if url_allowed(u, src):
+            out.append(u)
+
+    return out[:PER_SOURCE_ITEM_CAP * 3]  # loose cap pre-filter
+
+
+def build_item_from_product_page(url: str, src: dict) -> Item | None:
+    html_text, err = safe_fetch(url, timeout=30)
+    if not html_text:
+        return None
+
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    # Heuristic: product pages usually have og:title/og:image or Product JSON-LD
+    title = extract_title_from_page(soup)
+    if not title or not title_is_ok(title):
+        return None
+
+    # additional heuristics to reduce garbage
+    # - if no og:image AND no Product jsonld and title looks like navigation => drop
+    if not soup.find("meta", attrs={"property": "og:image"}) and not is_jsonld_product(soup):
+        # keep Kickstarter anyway (project pages)
+        if src.get("kind") != "crowdfunding":
+            # still allow if URL clearly looks like product and title ok
+            pass
+
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    image_url = extract_image_url(soup, base)
+    blurb = extract_blurb_from_page(soup)
+
+    return Item(
+        title=title.strip(),
+        url=url,
+        image_url=image_url.strip(),
+        source_id=src["id"],
+        source_label=src["label"],
+        kind=src.get("kind", "cz"),
+        priority=int(src.get("priority", 999)),
+        blurb=blurb.strip(),
+    )
+
+
+def scrape_source(src: dict) -> tuple[list[Item], list[str]]:
+    """Returns (items, warnings)"""
+    warnings = []
+    items: list[Item] = []
+
+    for page_url in src.get("urls", []):
+        listing_html, err = safe_fetch(page_url, timeout=30)
+        if not listing_html:
+            warnings.append(f"{src['label']}: nepodařilo se stáhnout ({err})")
+            continue
+
+        base = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+        candidates = extract_candidate_urls(listing_html, base, src)
+
+        # For Kickstarter discover pages, many links are duplicates; keep a smaller set
+        candidates = candidates[:PER_SOURCE_ITEM_CAP]
+
+        for u in candidates:
+            if len(items) >= PER_SOURCE_ITEM_CAP:
+                break
+            it = build_item_from_product_page(u, src)
+            if it:
+                items.append(it)
+
+    # dedupe inside source by title norm
+    out, seen = [], set()
+    for it in items:
+        nt = norm(it.title)
+        if nt in seen:
+            continue
+        seen.add(nt)
+        out.append(it)
+
+    return out[:PER_SOURCE_ITEM_CAP], warnings
+
+
+def merge_dedupe_items(items: list[Item]) -> list[Item]:
+    """
+    Dedupe by normalized title.
+    If multiple sources have same title, keep the one with lowest priority number
+    (TLAMA should have lower numbers in config).
+    """
+    best: dict[str, Item] = {}
+    for it in items:
+        key = norm(it.title)
+        cur = best.get(key)
+        if not cur:
+            best[key] = it
+            continue
+        if it.priority < cur.priority:
+            best[key] = it
+    return list(best.values())
+
+
+def match_expansion_to_owned(title: str, owned_norm_titles: list[str]) -> bool:
+    t = norm(title)
+    for game_nt in owned_norm_titles:
+        if len(game_nt) < 4:
+            continue
+        if game_nt in t:
+            return True
+    return False
+
+
+def build_email(owned_titles: list[str], all_items: list[Item], people: dict, meta: dict, warnings: list[str]) -> tuple[str, str]:
     owned_norm = [norm(t) for t in owned_titles]
 
+    cz_items = [it for it in all_items if it.kind == "cz"]
+    cf_items = [it for it in all_items if it.kind == "crowdfunding"]
+
     expansions_for_owned = []
-    new_games = []
-    for it in items:
-        title = it["title"]
-        if looks_like_expansion(title):
-            if match_expansion_to_owned(title, owned_norm):
+    new_games_cz = []
+    for it in cz_items:
+        if looks_like_expansion(it.title):
+            if match_expansion_to_owned(it.title, owned_norm):
                 expansions_for_owned.append(it)
         else:
-            new_games.append(it)
+            new_games_cz.append(it)
 
-    expansions_for_owned = expansions_for_owned[:10]
-    new_games = new_games[:12]
+    # separate crowdfunding: no expansion logic, just list
+    crowdfunding = cf_items
 
-    # === AI scoring (Top N) ===
+    # sort CZ: TLAMA-ish first by priority then alpha
+    new_games_cz.sort(key=lambda x: (x.priority, norm(x.title)))
+    expansions_for_owned.sort(key=lambda x: (x.priority, norm(x.title)))
+    crowdfunding.sort(key=lambda x: (x.priority, norm(x.title)))
+
+    # caps
+    expansions_for_owned = expansions_for_owned[:12]
+    new_games_cz = new_games_cz[:20]
+    crowdfunding = crowdfunding[:12]
+
+    # === AI scoring TOP picks across ALL (CZ + crowdfunding) ===
     top_block = []
     if os.environ.get("OPENAI_API_KEY"):
         client = OpenAI()
         group_text = summarize_group_for_prompt(people, meta)
 
-        candidates = new_games[:AI_SCORE_LIMIT]
+        candidates = (new_games_cz + crowdfunding)[:AI_SCORE_LIMIT]
         scored = []
         for it in candidates:
-            try:
-                product_html = fetch(it["url"])
-                blurb = extract_game_blurb_from_product_page(product_html)
-            except Exception:
-                blurb = it["title"]
-
-            score = ai_fit_score(client, group_text, it["title"], blurb)
+            blurb = it.blurb or it.title
+            score = ai_fit_score(client, group_text, it.title, blurb)
             scored.append((it, score))
 
         scored.sort(key=lambda x: x[1].get("fit", 0), reverse=True)
-        top = scored[:AI_TOP_N]
-
-        for it, score in top:
+        for it, score in scored[:AI_TOP_N]:
             top_block.append({"item": it, "score": score})
 
-    # ✅ remove TOP picks from the plain "Nové hry" list (no duplicates)
-    top_urls = {t["item"]["url"] for t in top_block} if top_block else set()
-    new_games_rest = [it for it in new_games if it["url"] not in top_urls]
+    # remove TOP items from lists (no duplicates)
+    top_urls = {t["item"].url for t in top_block} if top_block else set()
+    new_games_cz_rest = [it for it in new_games_cz if it.url not in top_urls]
+    crowdfunding_rest = [it for it in crowdfunding if it.url not in top_urls]
 
     # === Plain text ===
     lines = []
     lines.append(f"🎲 Deskovkový briefing – {date.today().isoformat()}")
     lines.append("")
+
     if top_block:
         lines.append("🏆 TOP tipy týdne (AI fit pro skupinu):")
         for t in top_block:
-            it = t["item"]
-            sc = t["score"]
-            lines.append(f"- {sc['fit']}/100 — {it['title']}")
+            it = t["item"]; sc = t["score"]
+            src = f"{it.source_label}"
+            lines.append(f"- {sc['fit']}/100 — {it.title}  ({src})")
             for w in sc.get("why", []):
                 lines.append(f"  • {w}")
             if sc.get("m_note"):
@@ -436,33 +574,48 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
                 lines.append(f"  • Š: {sc['s_note']}")
             for warn in sc.get("warnings", []):
                 lines.append(f"  ⚠️ {warn}")
-            lines.append(f"  {it['url']}")
+            lines.append(f"  {it.url}")
         lines.append("")
 
     lines.append("🧩 Rozšíření pro hry, které už máš:")
     if expansions_for_owned:
         for it in expansions_for_owned:
-            lines.append(f"- {it['title']} — {it['url']}")
+            lines.append(f"- {it.title} — {it.url} ({it.source_label})")
     else:
         lines.append("- (zatím nic jasného)")
     lines.append("")
 
-    lines.append("🆕 Nové hry (TLAMA):")
-    if new_games_rest:
-        for it in new_games_rest:
-            lines.append(f"- {it['title']} — {it['url']}")
+    lines.append("🇨🇿 Novinky v ČR (TLAMA + ostatní):")
+    if new_games_cz_rest:
+        for it in new_games_cz_rest:
+            lines.append(f"- {it.title} — {it.url} ({it.source_label})")
     else:
         lines.append("- (zbytek tento týden pokryl TOP výběr 🙂)")
+    lines.append("")
+
+    lines.append("🚀 Crowdfunding (Kickstarter):")
+    if crowdfunding_rest:
+        for it in crowdfunding_rest:
+            lines.append(f"- {it.title} — {it.url}")
+    else:
+        lines.append("- (zatím nic / nebo zdroj zrovna zlobí)")
+    lines.append("")
+
+    if warnings:
+        lines.append("⚠️ Poznámky ke zdrojům:")
+        for w in warnings[:6]:
+            lines.append(f"- {w}")
+
     text_body = "\n".join(lines)
 
     # === HTML ===
-    def card(it, extra_html=""):
-        t = html.escape(it["title"])
-        u = html.escape(it["url"])
-        img = it.get("image_url") or ""
+    def card(it: Item, extra_html: str = ""):
+        t = html.escape(it.title)
+        u = html.escape(it.url)
+        img = it.image_url or ""
         img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:10px;display:block;">' if img else ""
         left = f'<div style="flex:0 0 64px;">{img_tag}</div>' if img_tag else ""
-        extra = extra_html or ""
+        badge = f'<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">{html.escape(it.source_label)}</div>' if it.kind == "cz" else '<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">Kickstarter</div>'
         return f"""
         <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #2a2a2a;">
           {left}
@@ -470,22 +623,23 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
             <div style="font-size:15px;line-height:1.3;margin:0 0 4px 0;">
               <a href="{u}" style="color:#8ab4f8;text-decoration:none;">{t}</a>
             </div>
-            {extra}
+            {extra_html}
+            {badge}
             <div style="font-size:12px;color:#9aa0a6;word-break:break-all;">{u}</div>
           </div>
         </div>
         """
 
+    # TOP
     top_html = ""
     if top_block:
         blocks = []
         for t in top_block:
-            it = t["item"]
-            sc = t["score"]
+            it = t["item"]; sc = t["score"]
             why = sc.get("why", [])
             m_note = sc.get("m_note", "")
             s_note = sc.get("s_note", "")
-            warnings = sc.get("warnings", [])
+            warns = sc.get("warnings", [])
 
             parts = []
             if why:
@@ -501,24 +655,30 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
             if notes:
                 parts.append(f'<div style="margin:4px 0 0 0;color:#bdc1c6;font-size:12px;">{" | ".join(notes)}</div>')
 
-            if warnings:
-                parts.append(f'<div style="margin:4px 0 0 0;color:#f28b82;font-size:12px;">⚠️ {html.escape(" • ".join(warnings))}</div>')
+            if warns:
+                parts.append(f'<div style="margin:4px 0 0 0;color:#f28b82;font-size:12px;">⚠️ {html.escape(" • ".join(warns))}</div>')
 
-            extra = "\n".join(parts)
-            blocks.append(card(it, extra_html=extra))
+            blocks.append(card(it, extra_html="\n".join(parts)))
 
-        top_html = """
-        <h2 style="font-size:16px;margin:18px 0 8px 0;">🏆 TOP tipy týdne (AI fit)</h2>
-        """ + "".join(blocks)
+        top_html = '<h2 style="font-size:16px;margin:18px 0 8px 0;">🏆 TOP tipy týdne (AI fit)</h2>' + "".join(blocks)
 
     exp_html = "".join(card(it) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(zatím nic jasného)</div>'
-    games_html = "".join(card(it) for it in new_games_rest) or '<div style="color:#9aa0a6;">(zbytek tento týden pokryl TOP výběr 🙂)</div>'
+    cz_html = "".join(card(it) for it in new_games_cz_rest) or '<div style="color:#9aa0a6;">(zbytek tento týden pokryl TOP výběr 🙂)</div>'
+    cf_html = "".join(card(it) for it in crowdfunding_rest) or '<div style="color:#9aa0a6;">(zatím nic / nebo zdroj zrovna zlobí)</div>'
+
+    warn_html = ""
+    if warnings:
+        warn_lines = "".join(f"<li>{html.escape(w)}</li>" for w in warnings[:6])
+        warn_html = f"""
+        <h2 style="font-size:16px;margin:18px 0 8px 0;">⚠️ Poznámky ke zdrojům</h2>
+        <ul style="color:#bdc1c6;margin:0 0 6px 18px;padding:0;">{warn_lines}</ul>
+        """
 
     html_body = f"""
     <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#e8eaed;background:#121212;padding:18px;">
       <h1 style="font-size:20px;margin:0 0 8px 0;">🎲 Deskovkový briefing – {date.today().isoformat()}</h1>
       <div style="color:#bdc1c6;margin:0 0 16px 0;">
-        Ahoj! Novinky z TLAMA — jen deskovky (produkty), žádné menu/registrace. 🙂
+        TLAMA držíme jako hlavní zdroj. Když je hra i jinde, bereme TLAMA link. Když TLAMA nemá, bereme ostatní. 🙂
       </div>
 
       {top_html}
@@ -526,11 +686,16 @@ def build_email(owned_titles: list[str], items: list[dict], people: dict, meta: 
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🧩 Rozšíření pro hry, které už máš</h2>
       {exp_html}
 
-      <h2 style="font-size:16px;margin:18px 0 8px 0;">🆕 Nové hry (TLAMA)</h2>
-      {games_html}
+      <h2 style="font-size:16px;margin:18px 0 8px 0;">🇨🇿 Novinky v ČR (TLAMA + ostatní)</h2>
+      {cz_html}
+
+      <h2 style="font-size:16px;margin:18px 0 8px 0;">🚀 Crowdfunding (Kickstarter)</h2>
+      {cf_html}
+
+      {warn_html}
 
       <div style="margin-top:16px;color:#9aa0a6;font-size:12px;">
-        Zdroj: TLAMA “Novinky v češtině”. (Filtr: produktové stránky /deskove-hry/.)
+        Pozn.: některé weby (hlavně crowdfunding) občas mění strukturu / blokují scrapování. Když zlobí, uvidíš to v poznámkách.
       </div>
     </div>
     """.strip()
@@ -577,10 +742,20 @@ def main():
     owned = load_collection_titles(COLLECTION_CSV_URL)
     people, meta = load_group_profile(GROUP_CSV_URL)
 
-    tlama_html = fetch(TLAMA_URL)
-    items = extract_tlama_products(tlama_html)
+    sources = load_sources_config(SOURCES_YAML_PATH)
 
-    text_body, html_body = build_email(owned, items, people, meta)
+    all_items = []
+    warnings = []
+
+    for src in sources:
+        items, warns = scrape_source(src)
+        all_items.extend(items)
+        warnings.extend(warns)
+
+    # global dedupe + TLAMA preference by priority
+    all_items = merge_dedupe_items(all_items)
+
+    text_body, html_body = build_email(owned, all_items, people, meta, warnings)
 
     subject = f"Deskovkový briefing – {date.today().isoformat()}"
     if os.environ.get("OPENAI_API_KEY"):
