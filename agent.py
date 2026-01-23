@@ -297,7 +297,7 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "Dostaneš profil skupiny a krátký popis hry. "
         "Ohodnoť, jak moc je hra fit pro skupinu (0–100). "
         "Buď konkrétní a stručný. "
-        "Cíl: A) fit pro skupinu + 1–2 poznámky pro M (Monča) a Š (Šimon). "
+        "Cíl: A) fit pro skupinu + 1–2 poznámky pro Monču, Šimona, Káťu nebo Honzu). "
         "Pokud hra výrazně stojí na náhodě/kostkách, uveď varování."
     )
 
@@ -309,8 +309,10 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "{\n"
         '  "fit": 0,\n'
         '  "why": ["důvod 1", "důvod 2"],\n'
-        '  "m_note": "krátká poznámka pro M",\n'
-        '  "s_note": "krátká poznámka pro Š",\n'
+        '  "m_note": "krátká poznámka pro Monču",\n'
+        '  "s_note": "krátká poznámka pro Šimona",\n'
+        '  "h_note": "krátká poznámka pro Honzu",\n'
+        '  "k_note": "krátká poznámka pro Káťu",\n'
         '  "warnings": ["varování 1"]\n'
         "}\n"
         "fit musí být celé číslo 0–100. why max 2 položky."
