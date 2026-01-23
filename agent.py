@@ -47,7 +47,8 @@ PATH_BLACKLIST_CONTAINS = [
     "/prosenior", "/prorodinu", "/prozkusenehrace", "/strategicke-hry", "/hrypro",
     "/3-6let", "/7-12let", "/13-let", "/proholky", "/prokluky",
     "/tipy", "/sleva", "/akce", "/festival", "/deskovcon",
-    "/action/language", "/affiliate_",
+    "/action/language", "/affiliate_", "/deskove-hry/encyklopedie",
+    "/deskove-hry/deskove-hry",
 ]
 
 
