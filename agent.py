@@ -3,6 +3,8 @@
 # - deduplikuje hry napříč zdroji (preferuje TLAMA link, když existuje)
 # - AI TOP 3 napříč všemi CZ + crowdfunding (oddělené sekce v mailu)
 # - TOP tipy se neukazují podruhé v dalších seznamech
+#
+# ÚPRAVA: AI poznámky nejsou jen pro M a Š — AI vrací poznámky pro 2–4 členy (Honza, Káťa, Monča, Šimon).
 
 import os
 import re
@@ -297,7 +299,8 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "Dostaneš profil skupiny a krátký popis hry. "
         "Ohodnoť, jak moc je hra fit pro skupinu (0–100). "
         "Buď konkrétní a stručný. "
-        "Cíl: A) fit pro skupinu + 1–2 poznámky pro M (Monča) a Š (Šimon). "
+        "Cíl: A) fit pro skupinu + 2–4 krátké poznámky cílené na konkrétní členy (Honza, Káťa, Monča, Šimon). "
+        "Poznámky vybírej podle relevance (nemusí být pro všechny, ale ať to není pořád jen pro stejné dva). "
         "Pokud hra výrazně stojí na náhodě/kostkách, uveď varování."
     )
 
@@ -309,11 +312,16 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "{\n"
         '  "fit": 0,\n'
         '  "why": ["důvod 1", "důvod 2"],\n'
-        '  "m_note": "krátká poznámka pro M",\n'
-        '  "s_note": "krátká poznámka pro Š",\n'
+        '  "notes": [\n'
+        '    {"who": "Honza", "note": "krátká poznámka"},\n'
+        '    {"who": "Káťa", "note": "krátká poznámka"}\n'
+        "  ],\n"
         '  "warnings": ["varování 1"]\n'
         "}\n"
-        "fit musí být celé číslo 0–100. why max 2 položky."
+        "- fit musí být celé číslo 0–100.\n"
+        "- why max 2 položky.\n"
+        "- notes: dej 2 až 4 položky, who musí být JEN z: Honza, Káťa, Monča, Šimon.\n"
+        "- warnings max 2 položky."
     )
 
     resp = client.responses.create(
@@ -328,7 +336,7 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
     except Exception:
         m = re.search(r"\{.*\}", raw, flags=re.S)
         if not m:
-            return {"fit": 0, "why": ["AI odpověď nešla přečíst."], "m_note": "", "s_note": "", "warnings": ["AI output mimo JSON"]}
+            return {"fit": 0, "why": ["AI odpověď nešla přečíst."], "notes": [], "warnings": ["AI output mimo JSON"]}
         data = json.loads(m.group(0))
 
     try:
@@ -342,15 +350,34 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         why = []
     why = [str(x) for x in why][:2]
 
-    m_note = str(data.get("m_note", "")).strip()
-    s_note = str(data.get("s_note", "")).strip()
+    # notes validation/sanitization
+    allowed_people = {"Honza", "Káťa", "Monča", "Šimon"}
+    notes = data.get("notes", [])
+    out_notes = []
+    if isinstance(notes, list):
+        for n in notes:
+            if not isinstance(n, dict):
+                continue
+            who = str(n.get("who", "")).strip()
+            note = str(n.get("note", "")).strip()
+            if who in allowed_people and note:
+                out_notes.append({"who": who, "note": note})
+    # cap + ensure unique who order
+    seen_who = set()
+    dedup_notes = []
+    for n in out_notes:
+        if n["who"] in seen_who:
+            continue
+        seen_who.add(n["who"])
+        dedup_notes.append(n)
+    notes = dedup_notes[:4]
 
     warnings = data.get("warnings", [])
     if not isinstance(warnings, list):
         warnings = []
     warnings = [str(x) for x in warnings][:2]
 
-    return {"fit": fit, "why": why, "m_note": m_note, "s_note": s_note, "warnings": warnings}
+    return {"fit": fit, "why": why, "notes": notes, "warnings": warnings}
 
 
 def load_sources_config(path: str) -> list[dict]:
@@ -568,10 +595,15 @@ def build_email(owned_titles: list[str], all_items: list[Item], people: dict, me
             lines.append(f"- {sc['fit']}/100 — {it.title}  ({src})")
             for w in sc.get("why", []):
                 lines.append(f"  • {w}")
-            if sc.get("m_note"):
-                lines.append(f"  • M: {sc['m_note']}")
-            if sc.get("s_note"):
-                lines.append(f"  • Š: {sc['s_note']}")
+
+            notes = sc.get("notes", [])
+            if isinstance(notes, list) and notes:
+                for n in notes:
+                    who = n.get("who", "")
+                    note = n.get("note", "")
+                    if who and note:
+                        lines.append(f"  • {who}: {note}")
+
             for warn in sc.get("warnings", []):
                 lines.append(f"  ⚠️ {warn}")
             lines.append(f"  {it.url}")
@@ -637,23 +669,28 @@ def build_email(owned_titles: list[str], all_items: list[Item], people: dict, me
         for t in top_block:
             it = t["item"]; sc = t["score"]
             why = sc.get("why", [])
-            m_note = sc.get("m_note", "")
-            s_note = sc.get("s_note", "")
             warns = sc.get("warnings", [])
 
             parts = []
             if why:
-                parts.append(f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;"><b>{sc["fit"]}/100</b> — {html.escape(" • ".join(why))}</div>')
+                parts.append(
+                    f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;">'
+                    f'<b>{sc["fit"]}/100</b> — {html.escape(" • ".join(why))}</div>'
+                )
             else:
                 parts.append(f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;"><b>{sc["fit"]}/100</b></div>')
 
-            notes = []
-            if m_note:
-                notes.append(f'M: {html.escape(m_note)}')
-            if s_note:
-                notes.append(f'Š: {html.escape(s_note)}')
-            if notes:
-                parts.append(f'<div style="margin:4px 0 0 0;color:#bdc1c6;font-size:12px;">{" | ".join(notes)}</div>')
+            # notes (2–4 people)
+            notes = sc.get("notes", [])
+            if isinstance(notes, list) and notes:
+                nice = []
+                for n in notes:
+                    who = (n.get("who") or "").strip()
+                    note = (n.get("note") or "").strip()
+                    if who and note:
+                        nice.append(f'{html.escape(who)}: {html.escape(note)}')
+                if nice:
+                    parts.append(f'<div style="margin:4px 0 0 0;color:#bdc1c6;font-size:12px;">{" | ".join(nice)}</div>')
 
             if warns:
                 parts.append(f'<div style="margin:4px 0 0 0;color:#f28b82;font-size:12px;">⚠️ {html.escape(" • ".join(warns))}</div>')
