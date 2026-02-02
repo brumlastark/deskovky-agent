@@ -2,7 +2,7 @@ name: Deskovkový briefing v2
 
 on:
   schedule:
-    - cron: '45 12 * * *'  # Každý den 12:30 CET (test - blízko teď)
+    - cron: '10 7 * * *'  # Každý den 12:30 CET (test - blízko teď)
   workflow_dispatch:
 
 jobs:
