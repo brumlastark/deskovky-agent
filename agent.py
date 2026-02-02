@@ -771,6 +771,12 @@ def send_email(subject: str, text_body: str, html_body: str):
 
 
 def main():
+    # Spustit pouze v pondělí
+    if date.today().weekday() != 0:  # 0 = pondělí
+        print(f"Dnes je {date.today().strftime('%A')}, přeskakuji. Mail se posílá jen v pondělí.")
+        return
+    
+    required = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
     required = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
