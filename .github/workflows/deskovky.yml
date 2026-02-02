@@ -2,7 +2,7 @@ name: Deskovkový briefing
 
 on:
   schedule:
-    - cron: '45 10 * * *'
+    - cron: '05 10 * * *'
   workflow_dispatch:
 
 jobs:
