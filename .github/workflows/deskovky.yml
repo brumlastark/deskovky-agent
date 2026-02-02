@@ -1,8 +1,8 @@
 name: Deskovkový briefing
 
 on:
-schedule:
-  - cron: '20 9 * * *'  # Každý den 10:20 CET
+  schedule:
+    - cron: '20 9 * * *'
   workflow_dispatch:
 
 jobs:
