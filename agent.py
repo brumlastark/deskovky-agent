@@ -50,8 +50,10 @@ SOURCES_YAML_PATH = os.environ.get("SOURCES_YAML_PATH", "sources.yaml")
 
 # === AI SETTINGS ===
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
-AI_SCORE_LIMIT = int(os.environ.get("AI_SCORE_LIMIT", "10"))  # kolik kandidátů skórovat AI (cost control)
-AI_TOP_N = int(os.environ.get("AI_TOP_N", "3"))
+AI_SCORE_LIMIT_CZ = int(os.environ.get("AI_SCORE_LIMIT_CZ", "10"))  # kolik CZ kandidátů skórovat AI
+AI_SCORE_LIMIT_CF = int(os.environ.get("AI_SCORE_LIMIT_CF", "6"))   # kolik crowdfunding kandidátů skórovat AI
+AI_TOP_N_CZ = int(os.environ.get("AI_TOP_N_CZ", "3"))              # kolik TOP CZ tipů zobrazit
+AI_TOP_N_CF = int(os.environ.get("AI_TOP_N_CF", "2"))              # kolik TOP crowdfunding tipů zobrazit
 
 # how many items to collect from each source page (hard cap)
 PER_SOURCE_ITEM_CAP = int(os.environ.get("PER_SOURCE_ITEM_CAP", "30"))
@@ -701,39 +703,85 @@ def build_email(
     new_games_cz = new_games_cz[:20]
     crowdfunding = crowdfunding[:12]
 
-    # === AI scoring TOP picks across ALL (CZ + crowdfunding) ===
-    top_block = []
+    # === AI scoring - SEPARÁTNĚ pro CZ a crowdfunding ===
+    top_cz_block = []
+    top_cf_block = []
+    
     if os.environ.get("OPENAI_API_KEY"):
         client = OpenAI()
         group_text = summarize_group_for_prompt(people, meta)
 
-        candidates = (new_games_cz + crowdfunding)[:AI_SCORE_LIMIT]
-        scored = []
-        for it in candidates:
+        # --- CZ TOP tipy ---
+        log.info(f"🤖 AI hodnotí TOP {AI_TOP_N_CZ} z {min(len(new_games_cz), AI_SCORE_LIMIT_CZ)} CZ her...")
+        cz_candidates = new_games_cz[:AI_SCORE_LIMIT_CZ]
+        cz_scored = []
+        for it in cz_candidates:
             blurb = it.blurb or it.title
             score = ai_fit_score(client, group_text, it.title, blurb)
-            scored.append((it, score))
+            cz_scored.append((it, score))
+            log.debug(f"   {it.title}: {score.get('fit', 0)}/100")
 
-        scored.sort(key=lambda x: x[1].get("fit", 0), reverse=True)
-        for it, score in scored[:AI_TOP_N]:
-            top_block.append({"item": it, "score": score})
+        cz_scored.sort(key=lambda x: x[1].get("fit", 0), reverse=True)
+        for it, score in cz_scored[:AI_TOP_N_CZ]:
+            top_cz_block.append({"item": it, "score": score})
+        
+        # --- Crowdfunding TOP tipy ---
+        if crowdfunding:
+            log.info(f"🤖 AI hodnotí TOP {AI_TOP_N_CF} z {min(len(crowdfunding), AI_SCORE_LIMIT_CF)} crowdfunding her...")
+            cf_candidates = crowdfunding[:AI_SCORE_LIMIT_CF]
+            cf_scored = []
+            for it in cf_candidates:
+                blurb = it.blurb or it.title
+                score = ai_fit_score(client, group_text, it.title, blurb)
+                cf_scored.append((it, score))
+                log.debug(f"   {it.title}: {score.get('fit', 0)}/100")
+
+            cf_scored.sort(key=lambda x: x[1].get("fit", 0), reverse=True)
+            # Bereme jen ty s fitem >= 50 (má smysl doporučit)
+            for it, score in cf_scored[:AI_TOP_N_CF]:
+                if score.get("fit", 0) >= 40:  # minimální práh pro doporučení
+                    top_cf_block.append({"item": it, "score": score})
 
     # remove TOP items from lists (no duplicates)
-    top_urls = {t["item"].url for t in top_block} if top_block else set()
-    new_games_cz_rest = [it for it in new_games_cz if it.url not in top_urls]
-    crowdfunding_rest = [it for it in crowdfunding if it.url not in top_urls]
+    top_cz_urls = {t["item"].url for t in top_cz_block} if top_cz_block else set()
+    top_cf_urls = {t["item"].url for t in top_cf_block} if top_cf_block else set()
+    new_games_cz_rest = [it for it in new_games_cz if it.url not in top_cz_urls]
+    crowdfunding_rest = [it for it in crowdfunding if it.url not in top_cf_urls]
 
     # === Plain text ===
     lines = []
     lines.append(f"🎲 Deskovkový briefing – {date.today().isoformat()}")
     lines.append("")
 
-    if top_block:
-        lines.append("🏆 TOP tipy týdne (AI fit pro skupinu):")
-        for t in top_block:
+    # TOP CZ tipy
+    if top_cz_block:
+        lines.append("🏆 TOP tipy týdne – CZ novinky (AI fit pro skupinu):")
+        for t in top_cz_block:
             it = t["item"]; sc = t["score"]
             src = f"{it.source_label}"
             lines.append(f"- {sc['fit']}/100 — {it.title}  ({src})")
+            for w in sc.get("why", []):
+                lines.append(f"  • {w}")
+
+            notes = sc.get("notes", [])
+            if isinstance(notes, list) and notes:
+                for n in notes:
+                    who = n.get("who", "")
+                    note = n.get("note", "")
+                    if who and note:
+                        lines.append(f"  • {who}: {note}")
+
+            for warn in sc.get("warnings", []):
+                lines.append(f"  ⚠️ {warn}")
+            lines.append(f"  {it.url}")
+        lines.append("")
+
+    # TOP Crowdfunding tipy
+    if top_cf_block:
+        lines.append("🚀 TOP tipy z crowdfundingu (AI fit pro skupinu):")
+        for t in top_cf_block:
+            it = t["item"]; sc = t["score"]
+            lines.append(f"- {sc['fit']}/100 — {it.title} ({it.source_label})")
             for w in sc.get("why", []):
                 lines.append(f"  • {w}")
 
@@ -767,12 +815,12 @@ def build_email(
         lines.append("- (zbytek tento týden pokryl TOP výběr 🙂)")
     lines.append("")
 
-    lines.append("🚀 Crowdfunding (Kickstarter):")
+    lines.append("🚀 Další na crowdfundingu:")
     if crowdfunding_rest:
         for it in crowdfunding_rest:
-            lines.append(f"- {it.title} — {it.url}")
+            lines.append(f"- {it.title} — {it.url} ({it.source_label})")
     else:
-        lines.append("- (zatím nic / nebo zdroj zrovna zlobí)")
+        lines.append("- (zatím nic / nebo zdroje zrovna zlobí)")
     lines.append("")
 
     if warnings:
@@ -789,7 +837,8 @@ def build_email(
         img = it.image_url or ""
         img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:10px;display:block;">' if img else ""
         left = f'<div style="flex:0 0 64px;">{img_tag}</div>' if img_tag else ""
-        badge = f'<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">{html.escape(it.source_label)}</div>' if it.kind == "cz" else '<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">Kickstarter</div>'
+        # Zobrazujeme vždy source_label (TLAMA, Kickstarter, Gamefound, ...)
+        badge = f'<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">{html.escape(it.source_label)}</div>'
         
         # Pro rozšíření zobrazíme, ke které hře patří
         base_game_html = ""
@@ -811,9 +860,10 @@ def build_email(
         </div>
         """
 
-    # TOP
-    top_html = ""
-    if top_block:
+    # Helper pro generování TOP bloků
+    def build_top_html_block(top_block: list, title: str) -> str:
+        if not top_block:
+            return ""
         blocks = []
         for t in top_block:
             it = t["item"]; sc = t["score"]
@@ -846,7 +896,13 @@ def build_email(
 
             blocks.append(card(it, extra_html="\n".join(parts)))
 
-        top_html = '<h2 style="font-size:16px;margin:18px 0 8px 0;">🏆 TOP tipy týdne (AI fit)</h2>' + "".join(blocks)
+        return f'<h2 style="font-size:16px;margin:18px 0 8px 0;">{title}</h2>' + "".join(blocks)
+
+    # TOP CZ
+    top_cz_html = build_top_html_block(top_cz_block, "🏆 TOP tipy týdne – CZ novinky (AI fit)")
+    
+    # TOP Crowdfunding  
+    top_cf_html = build_top_html_block(top_cf_block, "🚀 TOP tipy z crowdfundingu (AI fit)")
 
     # Rozšíření - s informací o základní hře
     exp_html = "".join(card(it, show_base_game=True) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(žádná rozšíření pro tvé hry momentálně v nabídce)</div>'
@@ -868,7 +924,9 @@ def build_email(
         TLAMA držíme jako hlavní zdroj. Když je hra i jinde, bereme TLAMA link. Když TLAMA nemá, bereme ostatní. 🙂
       </div>
 
-      {top_html}
+      {top_cz_html}
+
+      {top_cf_html}
 
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🧩 Rozšíření pro hry, které už máš</h2>
       {exp_html}
@@ -876,7 +934,7 @@ def build_email(
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🇨🇿 Novinky v ČR (TLAMA + ostatní)</h2>
       {cz_html}
 
-      <h2 style="font-size:16px;margin:18px 0 8px 0;">🚀 Crowdfunding (Kickstarter)</h2>
+      <h2 style="font-size:16px;margin:18px 0 8px 0;">🚀 Další na crowdfundingu</h2>
       {cf_html}
 
       {warn_html}
@@ -955,7 +1013,7 @@ def main():
 
     subject = f"Deskovkový briefing – {date.today().isoformat()}"
     if os.environ.get("OPENAI_API_KEY"):
-        subject = f"Deskovkový briefing – TOP {AI_TOP_N} tipy (AI) ({date.today().isoformat()})"
+        subject = f"Deskovkový briefing – AI tipy ({date.today().isoformat()})"
 
     send_email(subject, text_body, html_body)
     log.info("✅ Email odeslán!")
