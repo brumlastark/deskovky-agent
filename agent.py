@@ -551,25 +551,20 @@ def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: li
     """
     Vrací (název_vlastněné_hry, typ_matche) nebo None.
     
-    typ_matche: "full" | "prefix3" | "prefix2" | "main_word"
+    typ_matche: "prefix_colon" | "full" | "prefix3" | "prefix2" | "main_word"
     
-    DŮLEŽITÉ: Najde VŠECHNY možné matche a vybere NEJLEPŠÍ.
-    Tohle řeší problém "Na křídlech" vs "Na křídlech draků" – 
-    pokud produkt je "Na křídlech: Oceánie", matchne se na "Na křídlech" (full match),
-    ne na "Na křídlech draků" (jen prefix match).
-    
-    Priorita matchů:
-    1. FULL match (celý název hry v názvu produktu) - nejvyšší priorita
-    2. PREFIX3 match (první 3 slova)
-    3. PREFIX2 match (první 2 slova)  
-    4. MAIN_WORD match (hlavní slovo) - nejnižší priorita
+    PRIORITA MATCHŮ (nižší = lepší):
+    1. PREFIX_COLON - produkt ZAČÍNÁ názvem hry + dvojtečka/pomlčka (nejspolehlivější!)
+       Např. "Na křídlech draků: Ohnivá akademie" → "Na křídlech draků"
+    2. FULL match - celý název hry je někde v názvu produktu
+    3. PREFIX3/PREFIX2 - první 2-3 slova (vyžaduje klíčové slovo)
+    4. MAIN_WORD - hlavní slovo (vyžaduje klíčové slovo)
     
     Při stejné prioritě se preferuje delší název vlastněné hry.
     """
     t = norm(title)
     
     # Sbíráme všechny matche: (priorita, délka_názvu, orig_title, match_type_str)
-    # Nižší priorita = lepší match
     matches: list[tuple[int, int, str, str]] = []
     
     for orig_title, game_nt in zip(owned_titles, owned_norm):
@@ -578,32 +573,40 @@ def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: li
         
         words = game_nt.split()
         
-        # 1. FULL match - celý název hry je v názvu rozšíření (priorita 1)
-        if game_nt in t:
-            matches.append((1, len(game_nt), orig_title, "full"))
-            continue  # Máme full match, nemusíme zkoušet slabší
-        
-        # 2. PREFIX3 match - první 3 slova (priorita 2)
-        if len(words) >= 3:
-            prefix3 = " ".join(words[:3])
-            if len(prefix3) >= 10 and prefix3 in t:  # Zvýšeno z 8 na 10 znaků
-                matches.append((2, len(prefix3), orig_title, "prefix3"))
+        # 1. PREFIX_COLON - produkt ZAČÍNÁ názvem hry + ":" nebo " -" nebo " –"
+        #    Tohle je nejspolehlivější pattern pro rozšíření!
+        #    "Na křídlech draků: Ohnivá akademie" začíná "na kridlech draku:"
+        for separator in [":", " -", " –", " —"]:
+            if t.startswith(game_nt + separator.lower()) or t.startswith(game_nt + separator):
+                matches.append((0, len(game_nt), orig_title, "prefix_colon"))
+                break
+        else:
+            # 2. FULL match - celý název hry je v názvu rozšíření (priorita 1)
+            if game_nt in t:
+                matches.append((1, len(game_nt), orig_title, "full"))
                 continue
-        
-        # 3. PREFIX2 match - první 2 slova (priorita 3)
-        if len(words) >= 2:
-            prefix2 = " ".join(words[:2])
-            if len(prefix2) >= 8 and prefix2 in t:  # Zvýšeno z 6 na 8 znaků
-                matches.append((3, len(prefix2), orig_title, "prefix2"))
-                continue
-        
-        # 4. MAIN_WORD match - nejdelší slovo (priorita 4)
-        if len(words) >= 1:
-            main_word = max(words, key=len)
-            if len(main_word) >= 6 and main_word in t:  # Zvýšeno z 5 na 6 znaků
-                generic_words = {"hry", "hra", "game", "games", "edition", "edice", "deluxe", "board", "card", "dice", "the"}
-                if main_word not in generic_words:
-                    matches.append((4, len(main_word), orig_title, "main_word"))
+            
+            # 3. PREFIX3 match - první 3 slova (priorita 2)
+            if len(words) >= 3:
+                prefix3 = " ".join(words[:3])
+                if len(prefix3) >= 10 and prefix3 in t:
+                    matches.append((2, len(prefix3), orig_title, "prefix3"))
+                    continue
+            
+            # 4. PREFIX2 match - první 2 slova (priorita 3)
+            if len(words) >= 2:
+                prefix2 = " ".join(words[:2])
+                if len(prefix2) >= 8 and prefix2 in t:
+                    matches.append((3, len(prefix2), orig_title, "prefix2"))
+                    continue
+            
+            # 5. MAIN_WORD match - nejdelší slovo (priorita 4)
+            if len(words) >= 1:
+                main_word = max(words, key=len)
+                if len(main_word) >= 6 and main_word in t:
+                    generic_words = {"hry", "hra", "game", "games", "edition", "edice", "deluxe", "board", "card", "dice", "the"}
+                    if main_word not in generic_words:
+                        matches.append((4, len(main_word), orig_title, "main_word"))
     
     if not matches:
         return None
@@ -615,11 +618,6 @@ def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: li
     priority, length, orig_title, match_type = best
     
     log.debug(f"  Match [{match_type}]: '{orig_title}' pro '{title}' (priorita {priority}, délka {length})")
-    
-    # Pokud máme víc matchů, logujeme pro debug
-    if len(matches) > 1:
-        other_matches = [f"{m[2]} ({m[3]})" for m in matches[1:3]]
-        log.debug(f"    (další možné matche: {', '.join(other_matches)})")
     
     return (orig_title, match_type)
 
@@ -651,17 +649,20 @@ def categorize_item(
     if match_result:
         matched_game, match_type = match_result
         
-        # FULL match = vždy OK (celý název hry je v produktu)
-        # PARTIAL match (prefix, main_word) = vyžaduje klíčové slovo
-        if match_type == "full":
-            log.info(f"   ✓ ROZŠÍŘENÍ (full match): '{item.title}' → '{matched_game}'")
+        # SPOLEHLIVÉ MATCHE (nevyžadují klíčové slovo):
+        # - prefix_colon: "Na křídlech draků: Ohnivá akademie" začíná "Na křídlech draků:"
+        # - full: celý název hry je v produktu
+        #
+        # SLABÉ MATCHE (vyžadují klíčové slovo "rozšíření/expansion"):
+        # - prefix2, prefix3, main_word
+        
+        if match_type in ("prefix_colon", "full"):
             return ("expansion_for_owned", matched_game)
         elif is_expansion_by_keyword:
-            log.info(f"   ✓ ROZŠÍŘENÍ ({match_type} + klíčové slovo): '{item.title}' → '{matched_game}'")
             return ("expansion_for_owned", matched_game)
         else:
             # Partial match BEZ klíčového slova = ignorujeme (pravděpodobně jiná hra)
-            log.debug(f"   ○ Partial match bez klíčového slova, ignoruji: '{item.title}' ~> '{matched_game}'")
+            log.debug(f"   Partial match bez klíčového slova: '{item.title}' ~> '{matched_game}'")
     
     if is_expansion_by_keyword:
         # Je to rozšíření (podle klíčového slova), ale ne pro naši hru
@@ -687,12 +688,17 @@ def build_email(
     # Debug: logujeme vlastněné hry
     log.info(f"📚 Načteno {len(owned_titles)} vlastněných her z tabulky")
     if owned_titles:
-        log.info(f"   Příklady: {owned_titles[:5]}...")
+        log.info(f"   Prvních 10 her: {owned_titles[:10]}")
     
     cz_items = [it for it in all_items if it.kind == "cz"]
     cf_items = [it for it in all_items if it.kind == "crowdfunding"]
     
     log.info(f"🔍 Analyzuji {len(cz_items)} CZ položek pro rozšíření...")
+    
+    # Debug: vypíšeme všechny CZ položky
+    log.info(f"   Všechny CZ položky:")
+    for it in cz_items[:15]:  # max 15 pro přehlednost
+        log.info(f"     - {it.title}")
     
     expansions_for_owned: list[Item] = []
     new_games_cz: list[Item] = []
@@ -701,12 +707,19 @@ def build_email(
     for it in cz_items:
         category, matched_game = categorize_item(it, owned_titles, owned_norm)
         
+        # Debug log pro každou položku
+        if category == "expansion_for_owned":
+            log.info(f"   ✅ '{it.title}' → rozšíření pro '{matched_game}'")
+        elif category == "expansion_other":
+            log.info(f"   ⏭️ '{it.title}' → rozšíření, ale ne pro tvou hru")
+        else:
+            log.debug(f"   ➡️ '{it.title}' → nová hra")
+        
         if category == "expansion_for_owned":
             it.matched_base_game = matched_game or ""
             expansions_for_owned.append(it)
         elif category == "expansion_other":
             skipped_other_expansions += 1
-            log.debug(f"   ○ Rozšíření pro jinou hru: '{it.title}'")
         else:
             new_games_cz.append(it)
     
