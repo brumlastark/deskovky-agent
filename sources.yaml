@@ -145,7 +145,7 @@ sources:
 
   # === Crowdfunding ===
   - id: kickstarter_tabletop
-    label: Kickstarter – Tabletop Games
+    label: Kickstarter
     kind: crowdfunding
     priority: 200
     urls:
@@ -156,3 +156,20 @@ sources:
       - "/discover/"
       - "/login"
       - "/signup"
+
+  - id: gamefound_tabletop
+    label: Gamefound
+    kind: crowdfunding
+    priority: 201
+    urls:
+      - https://gamefound.com/discover/board-games
+      - https://gamefound.com/discover/all?projectPhase=active&category=Board+Games
+    allow_domains: ["gamefound.com", "www.gamefound.com"]
+    product_url_must_contain_any:
+      - "/projects/"
+      - "/campaign/"
+    product_url_must_not_contain:
+      - "/discover/"
+      - "/login"
+      - "/signup"
+      - "/register"
