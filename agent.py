@@ -1,10 +1,14 @@
-# agent.py (v5) — CZ vydavatelé (TLAMA priorita) + Kickstarter + Kolekce + Skupina + AI TOP 3
+# agent.py (v6) — CZ vydavatelé (TLAMA priorita) + Kickstarter + Kolekce + Skupina + AI TOP 3
 # - čte sources.yaml
 # - deduplikuje hry napříč zdroji (preferuje TLAMA link, když existuje)
 # - AI TOP 3 napříč všemi CZ + crowdfunding (oddělené sekce v mailu)
 # - TOP tipy se neukazují podruhé v dalších seznamech
 #
-# ÚPRAVA: AI poznámky nejsou jen pro M a Š — AI vrací poznámky pro 2–4 členy (Honza, Káťa, Monča, Šimon).
+# v6 ZMĚNY:
+# - Vylepšená detekce rozšíření (fuzzy matching názvů)
+# - Rozšíření se matchují i bez klíčového slova "rozšíření" pokud obsahují název vlastněné hry
+# - V emailu se u rozšíření zobrazuje, ke které hře patří
+# - Debug logging pro diagnostiku
 
 import os
 import re
@@ -13,7 +17,8 @@ import io
 import html
 import json
 import unicodedata
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from datetime import date
 from urllib.parse import urlparse
 
@@ -23,6 +28,13 @@ import yaml
 
 from openai import OpenAI
 
+# === LOGGING ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 # === SHEETS ===
 COLLECTION_CSV_URL = os.environ.get(
@@ -37,7 +49,7 @@ GROUP_CSV_URL = os.environ.get(
 SOURCES_YAML_PATH = os.environ.get("SOURCES_YAML_PATH", "sources.yaml")
 
 # === AI SETTINGS ===
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 AI_SCORE_LIMIT = int(os.environ.get("AI_SCORE_LIMIT", "10"))  # kolik kandidátů skórovat AI (cost control)
 AI_TOP_N = int(os.environ.get("AI_TOP_N", "3"))
 
@@ -201,10 +213,11 @@ class Item:
     kind: str               # "cz" or "crowdfunding"
     priority: int
     blurb: str = ""         # short text from product page
+    matched_base_game: str = ""  # pro rozšíření: název základní hry, ke které patří
 
 
 def load_csv_rows(csv_url: str) -> list[list[str]]:
-    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/5.0"})
+    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/6.0"})
     r.raise_for_status()
     raw = r.text.lstrip("\ufeff")
     reader = csv.reader(io.StringIO(raw))
@@ -522,31 +535,159 @@ def merge_dedupe_items(items: list[Item]) -> list[Item]:
     return list(best.values())
 
 
-def match_expansion_to_owned(title: str, owned_norm_titles: list[str]) -> bool:
+# =============================================================================
+# VYLEPŠENÁ LOGIKA PRO ROZŠÍŘENÍ (v6)
+# =============================================================================
+
+def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: list[str]) -> str | None:
+    """
+    Vrací název vlastněné hry, ke které rozšíření patří, nebo None.
+    
+    DŮLEŽITÉ: Najde VŠECHNY možné matche a vybere NEJLEPŠÍ.
+    Tohle řeší problém "Na křídlech" vs "Na křídlech draků" – 
+    pokud produkt je "Na křídlech: Oceánie", matchne se na "Na křídlech" (full match),
+    ne na "Na křídlech draků" (jen prefix match).
+    
+    Priorita matchů:
+    1. FULL match (celý název hry v názvu produktu) - nejvyšší priorita
+    2. PREFIX3 match (první 3 slova)
+    3. PREFIX2 match (první 2 slova)  
+    4. MAIN_WORD match (hlavní slovo) - nejnižší priorita
+    
+    Při stejné prioritě se preferuje delší název vlastněné hry.
+    """
     t = norm(title)
-    for game_nt in owned_norm_titles:
+    
+    # Sbíráme všechny matche: (priorita, délka_názvu, orig_title, match_type_str)
+    # Nižší priorita = lepší match
+    matches: list[tuple[int, int, str, str]] = []
+    
+    for orig_title, game_nt in zip(owned_titles, owned_norm):
         if len(game_nt) < 4:
             continue
+        
+        words = game_nt.split()
+        
+        # 1. FULL match - celý název hry je v názvu rozšíření (priorita 1)
         if game_nt in t:
-            return True
-    return False
+            matches.append((1, len(game_nt), orig_title, "full"))
+            continue  # Máme full match, nemusíme zkoušet slabší
+        
+        # 2. PREFIX3 match - první 3 slova (priorita 2)
+        if len(words) >= 3:
+            prefix3 = " ".join(words[:3])
+            if len(prefix3) >= 8 and prefix3 in t:
+                matches.append((2, len(prefix3), orig_title, "prefix3"))
+                continue
+        
+        # 3. PREFIX2 match - první 2 slova (priorita 3)
+        if len(words) >= 2:
+            prefix2 = " ".join(words[:2])
+            if len(prefix2) >= 6 and prefix2 in t:
+                matches.append((3, len(prefix2), orig_title, "prefix2"))
+                continue
+        
+        # 4. MAIN_WORD match - nejdelší slovo (priorita 4)
+        if len(words) >= 1:
+            main_word = max(words, key=len)
+            if len(main_word) >= 5 and main_word in t:
+                generic_words = {"hry", "hra", "game", "games", "edition", "edice", "deluxe", "board"}
+                if main_word not in generic_words:
+                    matches.append((4, len(main_word), orig_title, "main_word"))
+    
+    if not matches:
+        return None
+    
+    # Seřadíme: nejdřív podle priority (nižší = lepší), pak podle délky (delší = lepší)
+    matches.sort(key=lambda x: (x[0], -x[1]))
+    
+    best = matches[0]
+    priority, length, orig_title, match_type = best
+    
+    log.debug(f"  ✓ Match [{match_type}]: '{orig_title}' pro '{title}' (priorita {priority}, délka {length})")
+    
+    # Pokud máme víc matchů, logujeme pro debug
+    if len(matches) > 1:
+        other_matches = [f"{m[2]} ({m[3]})" for m in matches[1:3]]
+        log.debug(f"    (další možné matche: {', '.join(other_matches)})")
+    
+    return orig_title
 
 
-def build_email(owned_titles: list[str], all_items: list[Item], people: dict, meta: dict, warnings: list[str]) -> tuple[str, str]:
+def categorize_item(
+    item: Item, 
+    owned_titles: list[str], 
+    owned_norm: list[str]
+) -> tuple[str, str | None]:
+    """
+    Vrací (kategorie, matched_game).
+    
+    kategorie: 
+      - "expansion_for_owned" = rozšíření pro hru, kterou vlastníme
+      - "expansion_other" = rozšíření, ale ne pro naši hru
+      - "new_game" = nová hra (ne rozšíření)
+    
+    matched_game: název základní hry (jen pro expansion_for_owned)
+    """
+    is_expansion_by_keyword = looks_like_expansion(item.title)
+    matched_game = match_expansion_to_owned(item.title, owned_titles, owned_norm)
+    
+    if matched_game:
+        # Matchuje vlastněnou hru
+        # Může to být rozšíření NEBO nová edice/verze - obojí je relevantní
+        return ("expansion_for_owned", matched_game)
+    
+    if is_expansion_by_keyword:
+        # Je to rozšíření (podle klíčového slova), ale ne pro naši hru
+        return ("expansion_other", None)
+    
+    return ("new_game", None)
+
+
+# =============================================================================
+# BUILD EMAIL
+# =============================================================================
+
+def build_email(
+    owned_titles: list[str], 
+    all_items: list[Item], 
+    people: dict, 
+    meta: dict, 
+    warnings: list[str]
+) -> tuple[str, str]:
+    
     owned_norm = [norm(t) for t in owned_titles]
-
+    
+    # Debug: logujeme vlastněné hry
+    log.info(f"📚 Načteno {len(owned_titles)} vlastněných her z tabulky")
+    if owned_titles:
+        log.info(f"   Příklady: {owned_titles[:5]}...")
+    
     cz_items = [it for it in all_items if it.kind == "cz"]
     cf_items = [it for it in all_items if it.kind == "crowdfunding"]
-
-    expansions_for_owned = []
-    new_games_cz = []
+    
+    log.info(f"🔍 Analyzuji {len(cz_items)} CZ položek pro rozšíření...")
+    
+    expansions_for_owned: list[Item] = []
+    new_games_cz: list[Item] = []
+    skipped_other_expansions = 0
+    
     for it in cz_items:
-        if looks_like_expansion(it.title):
-            if match_expansion_to_owned(it.title, owned_norm):
-                expansions_for_owned.append(it)
+        category, matched_game = categorize_item(it, owned_titles, owned_norm)
+        
+        if category == "expansion_for_owned":
+            it.matched_base_game = matched_game or ""
+            expansions_for_owned.append(it)
+            log.info(f"   ✓ ROZŠÍŘENÍ: '{it.title}' → pro hru '{matched_game}'")
+        elif category == "expansion_other":
+            skipped_other_expansions += 1
+            log.debug(f"   ○ Rozšíření pro jinou hru: '{it.title}'")
         else:
             new_games_cz.append(it)
-
+    
+    log.info(f"📊 Výsledek: {len(expansions_for_owned)} rozšíření pro vlastněné hry, "
+             f"{len(new_games_cz)} nových her, {skipped_other_expansions} rozšíření pro jiné hry")
+    
     # separate crowdfunding: no expansion logic, just list
     crowdfunding = cf_items
 
@@ -612,9 +753,10 @@ def build_email(owned_titles: list[str], all_items: list[Item], people: dict, me
     lines.append("🧩 Rozšíření pro hry, které už máš:")
     if expansions_for_owned:
         for it in expansions_for_owned:
-            lines.append(f"- {it.title} — {it.url} ({it.source_label})")
+            base_info = f" → {it.matched_base_game}" if it.matched_base_game else ""
+            lines.append(f"- {it.title}{base_info} — {it.url} ({it.source_label})")
     else:
-        lines.append("- (zatím nic jasného)")
+        lines.append("- (žádná rozšíření pro tvé hry momentálně v nabídce)")
     lines.append("")
 
     lines.append("🇨🇿 Novinky v ČR (TLAMA + ostatní):")
@@ -641,13 +783,19 @@ def build_email(owned_titles: list[str], all_items: list[Item], people: dict, me
     text_body = "\n".join(lines)
 
     # === HTML ===
-    def card(it: Item, extra_html: str = ""):
+    def card(it: Item, extra_html: str = "", show_base_game: bool = False):
         t = html.escape(it.title)
         u = html.escape(it.url)
         img = it.image_url or ""
         img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:10px;display:block;">' if img else ""
         left = f'<div style="flex:0 0 64px;">{img_tag}</div>' if img_tag else ""
         badge = f'<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">{html.escape(it.source_label)}</div>' if it.kind == "cz" else '<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">Kickstarter</div>'
+        
+        # Pro rozšíření zobrazíme, ke které hře patří
+        base_game_html = ""
+        if show_base_game and it.matched_base_game:
+            base_game_html = f'<div style="font-size:12px;color:#81c995;margin-top:2px;">→ pro hru: {html.escape(it.matched_base_game)}</div>'
+        
         return f"""
         <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #2a2a2a;">
           {left}
@@ -656,6 +804,7 @@ def build_email(owned_titles: list[str], all_items: list[Item], people: dict, me
               <a href="{u}" style="color:#8ab4f8;text-decoration:none;">{t}</a>
             </div>
             {extra_html}
+            {base_game_html}
             {badge}
             <div style="font-size:12px;color:#9aa0a6;word-break:break-all;">{u}</div>
           </div>
@@ -699,7 +848,8 @@ def build_email(owned_titles: list[str], all_items: list[Item], people: dict, me
 
         top_html = '<h2 style="font-size:16px;margin:18px 0 8px 0;">🏆 TOP tipy týdne (AI fit)</h2>' + "".join(blocks)
 
-    exp_html = "".join(card(it) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(zatím nic jasného)</div>'
+    # Rozšíření - s informací o základní hře
+    exp_html = "".join(card(it, show_base_game=True) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(žádná rozšíření pro tvé hry momentálně v nabídce)</div>'
     cz_html = "".join(card(it) for it in new_games_cz_rest) or '<div style="color:#9aa0a6;">(zbytek tento týden pokryl TOP výběr 🙂)</div>'
     cf_html = "".join(card(it) for it in crowdfunding_rest) or '<div style="color:#9aa0a6;">(zatím nic / nebo zdroj zrovna zlobí)</div>'
 
@@ -771,32 +921,35 @@ def send_email(subject: str, text_body: str, html_body: str):
 
 
 def main():
-    # Spustit pouze v pondělí
-    if date.today().weekday() != 0:  # 0 = pondělí
-        print(f"Dnes je {date.today().strftime('%A')}, přeskakuji. Mail se posílá jen v pondělí.")
-        return
-    
-    required = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
     required = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "MAIL_TO"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
         raise RuntimeError(f"Missing env vars: {missing}")
 
+    log.info("🚀 Spouštím Deskovkový briefing v6...")
+    
     owned = load_collection_titles(COLLECTION_CSV_URL)
+    log.info(f"📚 Načteno {len(owned)} vlastněných her")
+    
     people, meta = load_group_profile(GROUP_CSV_URL)
+    log.info(f"👥 Načteno {len(people)} profilů hráčů")
 
     sources = load_sources_config(SOURCES_YAML_PATH)
+    log.info(f"🌐 Načteno {len(sources)} zdrojů")
 
     all_items = []
     warnings = []
 
     for src in sources:
+        log.info(f"   Scrapuji: {src['label']}...")
         items, warns = scrape_source(src)
+        log.info(f"   → {len(items)} položek")
         all_items.extend(items)
         warnings.extend(warns)
 
     # global dedupe + TLAMA preference by priority
     all_items = merge_dedupe_items(all_items)
+    log.info(f"📦 Celkem {len(all_items)} unikátních položek po deduplikaci")
 
     text_body, html_body = build_email(owned, all_items, people, meta, warnings)
 
@@ -805,6 +958,7 @@ def main():
         subject = f"Deskovkový briefing – TOP {AI_TOP_N} tipy (AI) ({date.today().isoformat()})"
 
     send_email(subject, text_body, html_body)
+    log.info("✅ Email odeslán!")
 
 
 if __name__ == "__main__":
