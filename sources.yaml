@@ -40,6 +40,27 @@ sources:
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
 
+  # Katalog pro zachycení rozšíření, která jsou už skladem
+  - id: tlama_katalog
+    label: TLAMA – Katalog
+    kind: cz
+    priority: 15
+    urls:
+      - https://www.tlamagames.com/deskove-hry/
+    allow_domains: ["www.tlamagames.com"]
+    product_url_must_contain: ["/deskove-hry/"]
+    product_url_must_not_contain:
+      - "/registrace"
+      - "/klient/"
+      - "/kosik"
+      - "/obchodni-"
+      - "/podminky"
+      - "/doprava_"
+      - "/affiliate"
+      - "/action/language"
+      - "/deskove-hry/encyklopedie"
+      - "/deskove-hry/deskove-hry"
+
   - id: rexhry_katalog
     label: Rexhry – Katalog (nejnovější)
     kind: cz
