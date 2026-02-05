@@ -1,8 +1,8 @@
-name: Deskovkový briefing v2
+name: Deskovkový briefing
 
 on:
   schedule:
-    - cron: '10 7 * * *'  # Každý den 12:30 CET (test - blízko teď)
+    - cron: '05 10 * * *'
   workflow_dispatch:
 
 jobs:
@@ -35,6 +35,15 @@ jobs:
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
           GROUP_CSV_URL: ${{ secrets.GROUP_CSV_URL }}
-          OWNED_CSV_URL: ${{ secrets.OWNED_CSV_URL }}
+          COLLECTION_CSV_URL: ${{ secrets.COLLECTION_CSV_URL }}
+          
+          # Scraping limits
+          PER_SOURCE_ITEM_CAP: ${{ secrets.PER_SOURCE_ITEM_CAP }}
+          
+          # AI limits (optional)
+          AI_SCORE_LIMIT_CZ: ${{ secrets.AI_SCORE_LIMIT_CZ }}
+          AI_SCORE_LIMIT_CF: ${{ secrets.AI_SCORE_LIMIT_CF }}
+          AI_TOP_N_CZ: ${{ secrets.AI_TOP_N_CZ }}
+          AI_TOP_N_CF: ${{ secrets.AI_TOP_N_CF }}
         run: |
           python agent.py
