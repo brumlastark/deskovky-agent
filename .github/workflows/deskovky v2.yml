@@ -35,7 +35,7 @@ jobs:
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
 
           GROUP_CSV_URL: ${{ secrets.GROUP_CSV_URL }}
-          COLLECTION_CSV_URL: ${{ secrets.COLLECTION_CSV_URL }}
+          COLLECTION_CSV_URL: ${{ secrets.OWNED_CSV_URL }}
           
           # Scraping limits
           PER_SOURCE_ITEM_CAP: ${{ secrets.PER_SOURCE_ITEM_CAP }}
