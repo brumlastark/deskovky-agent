@@ -37,26 +37,37 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # === SHEETS ===
-COLLECTION_CSV_URL = os.environ.get(
+def _str_env(key: str, default: str) -> str:
+    """Bezpečně načte string z env, prázdný string = default."""
+    val = os.environ.get(key, "").strip()
+    return val if val else default
+
+COLLECTION_CSV_URL = _str_env(
     "COLLECTION_CSV_URL",
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vTmHPN69oIL7Fit5EN_K6HXtYtEPOZi2v-KmFL85D-wQsljrIT3cDY_Uh0LShOiIDfOx6rGJPlfESa2/pub?output=csv",
 )
-GROUP_CSV_URL = os.environ.get(
+GROUP_CSV_URL = _str_env(
     "GROUP_CSV_URL",
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vQsZls09kQMlBDG8kMyzb-bjIpEV9ON8zbK6a1dYS9Imp9tUcgBzQmNrFH9dtq2ySIG_afmTewJx1-1/pub?output=csv",
 )
 
-SOURCES_YAML_PATH = os.environ.get("SOURCES_YAML_PATH", "sources.yaml")
+SOURCES_YAML_PATH = _str_env("SOURCES_YAML_PATH", "sources.yaml")
 
 # === AI SETTINGS ===
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
-AI_SCORE_LIMIT_CZ = int(os.environ.get("AI_SCORE_LIMIT_CZ", "10"))  # kolik CZ kandidátů skórovat AI
-AI_SCORE_LIMIT_CF = int(os.environ.get("AI_SCORE_LIMIT_CF", "6"))   # kolik crowdfunding kandidátů skórovat AI
-AI_TOP_N_CZ = int(os.environ.get("AI_TOP_N_CZ", "3"))              # kolik TOP CZ tipů zobrazit
-AI_TOP_N_CF = int(os.environ.get("AI_TOP_N_CF", "2"))              # kolik TOP crowdfunding tipů zobrazit
+OPENAI_MODEL = _str_env("OPENAI_MODEL", "gpt-4o")
+
+def _int_env(key: str, default: int) -> int:
+    """Bezpečně načte int z env, prázdný string = default."""
+    val = os.environ.get(key, "").strip()
+    return int(val) if val else default
+
+AI_SCORE_LIMIT_CZ = _int_env("AI_SCORE_LIMIT_CZ", 10)  # kolik CZ kandidátů skórovat AI
+AI_SCORE_LIMIT_CF = _int_env("AI_SCORE_LIMIT_CF", 6)   # kolik crowdfunding kandidátů skórovat AI
+AI_TOP_N_CZ = _int_env("AI_TOP_N_CZ", 3)              # kolik TOP CZ tipů zobrazit
+AI_TOP_N_CF = _int_env("AI_TOP_N_CF", 2)              # kolik TOP crowdfunding tipů zobrazit
 
 # how many items to collect from each source page (hard cap)
-PER_SOURCE_ITEM_CAP = int(os.environ.get("PER_SOURCE_ITEM_CAP", "30"))
+PER_SOURCE_ITEM_CAP = _int_env("PER_SOURCE_ITEM_CAP", 30)
 
 # === expansion detection ===
 EXPANSION_KEYWORDS = [
@@ -1003,7 +1014,7 @@ def send_email(subject: str, text_body: str, html_body: str):
     from email.utils import make_msgid
 
     smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_port = _int_env("SMTP_PORT", 587)
     smtp_user = os.environ["SMTP_USER"]
     smtp_pass = os.environ["SMTP_PASS"]
     mail_from = os.environ["MAIL_FROM"]
