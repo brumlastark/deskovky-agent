@@ -648,21 +648,33 @@ def categorize_item(
     
     if match_result:
         matched_game, match_type = match_result
+        matched_game_len = len(norm(matched_game))
         
         # SPOLEHLIVÉ MATCHE (nevyžadují klíčové slovo):
         # - prefix_colon: "Na křídlech draků: Ohnivá akademie" začíná "Na křídlech draků:"
         # - full: celý název hry je v produktu
         #
-        # SLABÉ MATCHE (vyžadují klíčové slovo "rozšíření/expansion"):
+        # ALE: krátké názvy (< 8 znaků) jako "Duna", "Catan" atd. 
+        # můžou mít podtituly i u samostatných her ("Duna: Tajemství rodu")
+        # → u krátkých názvů VŽDY vyžadujeme klíčové slovo
+        #
+        # SLABÉ MATCHE (vždy vyžadují klíčové slovo):
         # - prefix2, prefix3, main_word
         
-        if match_type in ("prefix_colon", "full"):
+        is_short_name = matched_game_len < 10  # "Na křídlech" = 10, "Duna" = 4
+        
+        if match_type in ("prefix_colon", "full") and not is_short_name:
+            # Dlouhý název + spolehlivý match = OK
             return ("expansion_for_owned", matched_game)
         elif is_expansion_by_keyword:
+            # Krátký název nebo slabý match, ale máme klíčové slovo = OK
             return ("expansion_for_owned", matched_game)
         else:
-            # Partial match BEZ klíčového slova = ignorujeme (pravděpodobně jiná hra)
-            log.debug(f"   Partial match bez klíčového slova: '{item.title}' ~> '{matched_game}'")
+            # Krátký název bez klíčového slova = ignorujeme (možná samostatná hra)
+            if is_short_name:
+                log.debug(f"   Krátký název bez klíčového slova: '{item.title}' ~> '{matched_game}'")
+            else:
+                log.debug(f"   Partial match bez klíčového slova: '{item.title}' ~> '{matched_game}'")
     
     if is_expansion_by_keyword:
         # Je to rozšíření (podle klíčového slova), ale ne pro naši hru
