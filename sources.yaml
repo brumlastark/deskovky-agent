@@ -77,7 +77,7 @@ sources:
       type: query_param
       param: page
       start: 1
-      max_pages: 8
+      max_pages: 20
 
   - id: rexhry_katalog
     label: Rexhry – Katalog (nejnovější)
