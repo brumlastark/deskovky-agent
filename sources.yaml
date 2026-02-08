@@ -1,5 +1,6 @@
 sources:
   # === CZ (priorita: nižší číslo = vyšší priorita při shodě titulu) ===
+  
   - id: tlama_novinky
     label: TLAMA – Novinky v češtině
     kind: cz
@@ -19,6 +20,12 @@ sources:
       - "/action/language"
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
+    # Novinky jsou obvykle na 1-2 stránkách
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 2
 
   - id: tlama_predprodej
     label: TLAMA – Předprodej
@@ -39,6 +46,11 @@ sources:
       - "/action/language"
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 2
 
   # Katalog pro zachycení rozšíření, která jsou už skladem
   - id: tlama_katalog
@@ -60,6 +72,12 @@ sources:
       - "/action/language"
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
+    # Katalog má hodně stránek - procházíme více pro rozšíření
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 8
 
   - id: rexhry_katalog
     label: Rexhry – Katalog (nejnovější)
@@ -76,6 +94,11 @@ sources:
     product_url_must_not_contain:
       - "/katalog?"
       - "/pripravujeme"
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 5
 
   - id: rexhry_pripravujeme
     label: Rexhry – Připravujeme
@@ -89,6 +112,9 @@ sources:
       - "/produkt/"
       - "/hra/"
       - "/hry/"
+    # Připravujeme je obvykle krátký seznam
+    pagination:
+      type: none
 
   - id: albi_hry
     label: Albi – Hry
@@ -101,6 +127,11 @@ sources:
       - "/hry/"
     product_url_must_not_contain:
       - "/edicni-plan"
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 5
 
   - id: albi_edicni_plan
     label: Albi – Ediční plán
@@ -113,6 +144,8 @@ sources:
       - "/hry/"
       - "/produkt/"
       - "/produkt-detail/"
+    pagination:
+      type: none
 
   - id: asmodee_katalog
     label: Asmodee CZ – Katalog
@@ -127,6 +160,11 @@ sources:
       - "/hry/"
     product_url_must_not_contain:
       - "/pripravujeme/"
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 4
 
   - id: asmodee_pripravujeme
     label: Asmodee CZ – Připravujeme
@@ -139,6 +177,8 @@ sources:
       - "/katalog-her/"
       - "/hra/"
       - "/hry/"
+    pagination:
+      type: none
 
   - id: mindok_nase_hry
     label: MindOK – Naše hry (nejnovější)
@@ -151,6 +191,11 @@ sources:
       - "/hry/"
       - "/nase-hry/"
       - "/hra/"
+    pagination:
+      type: query_param
+      param: page
+      start: 1
+      max_pages: 4
 
   - id: mindok_pripravujeme
     label: MindOK – Připravujeme
@@ -163,8 +208,13 @@ sources:
       - "/hry/"
       - "/nase-hry/"
       - "/hra/"
+    pagination:
+      type: none
 
   # === Crowdfunding ===
+  # Poznámka: Kickstarter a Gamefound používají JavaScript pro načítání obsahu,
+  # paginace přes URL nefunguje spolehlivě. Bereme jen první stránku.
+  
   - id: kickstarter_tabletop
     label: Kickstarter
     kind: crowdfunding
@@ -177,6 +227,8 @@ sources:
       - "/discover/"
       - "/login"
       - "/signup"
+    pagination:
+      type: none
 
   - id: gamefound_tabletop
     label: Gamefound
@@ -194,3 +246,5 @@ sources:
       - "/login"
       - "/signup"
       - "/register"
+    pagination:
+      type: none
