@@ -1,14 +1,14 @@
-# agent.py (v6) — CZ vydavatelé (TLAMA priorita) + Kickstarter + Kolekce + Skupina + AI TOP 3
-# - čte sources.yaml
+# agent.py (v7) — CZ vydavatelé + Kickstarter + Kolekce + Skupina + AI TOP + PAGINACE
+# - čte sources.yaml s paginační konfigurací
 # - deduplikuje hry napříč zdroji (preferuje TLAMA link, když existuje)
-# - AI TOP 3 napříč všemi CZ + crowdfunding (oddělené sekce v mailu)
+# - AI TOP tipy napříč všemi CZ + crowdfunding (oddělené sekce v mailu)
 # - TOP tipy se neukazují podruhé v dalších seznamech
 #
-# v6 ZMĚNY:
-# - Vylepšená detekce rozšíření (fuzzy matching názvů)
-# - Rozšíření se matchují i bez klíčového slova "rozšíření" pokud obsahují název vlastněné hry
-# - V emailu se u rozšíření zobrazuje, ke které hře patří
-# - Debug logging pro diagnostiku
+# v7 ZMĚNY:
+# - Podpora paginace pro katalogy (TLAMA, Rexhry, Albi, ...)
+# - Konfigurace paginace v sources.yaml (type, param, start, max_pages)
+# - Lepší logování průběhu scrapování
+# - Zvýšený celkový limit položek pro katalogy
 
 import os
 import re
@@ -20,7 +20,7 @@ import unicodedata
 import logging
 from dataclasses import dataclass, field
 from datetime import date
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, urlunparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -66,8 +66,11 @@ AI_SCORE_LIMIT_CF = _int_env("AI_SCORE_LIMIT_CF", 6)   # kolik crowdfunding kand
 AI_TOP_N_CZ = _int_env("AI_TOP_N_CZ", 3)              # kolik TOP CZ tipů zobrazit
 AI_TOP_N_CF = _int_env("AI_TOP_N_CF", 2)              # kolik TOP crowdfunding tipů zobrazit
 
-# how many items to collect from each source page (hard cap)
-PER_SOURCE_ITEM_CAP = _int_env("PER_SOURCE_ITEM_CAP", 30)
+# how many items to collect from each source (across all pages)
+PER_SOURCE_ITEM_CAP = _int_env("PER_SOURCE_ITEM_CAP", 60)
+
+# how many product URLs to try per single listing page
+PER_PAGE_URL_CAP = _int_env("PER_PAGE_URL_CAP", 40)
 
 # === expansion detection ===
 EXPANSION_KEYWORDS = [
@@ -236,7 +239,7 @@ class Item:
 
 
 def load_csv_rows(csv_url: str) -> list[list[str]]:
-    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/6.0"})
+    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/7.0"})
     r.raise_for_status()
     raw = r.text.lstrip("\ufeff")
     reader = csv.reader(io.StringIO(raw))
@@ -461,7 +464,7 @@ def extract_candidate_urls(listing_html: str, base_url: str, src: dict) -> list[
         if url_allowed(u, src):
             out.append(u)
 
-    return out[:PER_SOURCE_ITEM_CAP * 3]  # loose cap pre-filter
+    return out[:PER_PAGE_URL_CAP * 2]  # loose cap pre-filter
 
 
 def build_item_from_product_page(url: str, src: dict) -> Item | None:
@@ -500,29 +503,128 @@ def build_item_from_product_page(url: str, src: dict) -> Item | None:
     )
 
 
+# =============================================================================
+# PAGINACE (v7)
+# =============================================================================
+
+def build_paginated_url(base_url: str, page_num: int, pagination_config: dict) -> str:
+    """
+    Sestaví URL pro danou stránku podle konfigurace paginace.
+    
+    Podporované typy:
+    - query_param: přidá ?param=page_num (např. ?page=2)
+    - path: přidá /page/page_num na konec URL
+    - none: vrátí původní URL
+    """
+    pag_type = pagination_config.get("type", "none")
+    
+    if pag_type == "none" or page_num <= pagination_config.get("start", 1):
+        # První stránka = původní URL
+        return base_url
+    
+    if pag_type == "query_param":
+        param_name = pagination_config.get("param", "page")
+        
+        # Parsujeme URL
+        parsed = urlparse(base_url)
+        
+        # Získáme existující query parametry
+        existing_params = parse_qs(parsed.query)
+        
+        # Přidáme/přepíšeme page parametr
+        existing_params[param_name] = [str(page_num)]
+        
+        # Sestavíme nový query string
+        new_query = urlencode(existing_params, doseq=True)
+        
+        # Sestavíme novou URL
+        new_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment
+        ))
+        return new_url
+    
+    if pag_type == "path":
+        # Přidáme /page/X na konec
+        clean_base = base_url.rstrip("/")
+        return f"{clean_base}/page/{page_num}"
+    
+    # Neznámý typ = původní URL
+    return base_url
+
+
 def scrape_source(src: dict) -> tuple[list[Item], list[str]]:
-    """Returns (items, warnings)"""
+    """
+    Scrapuje zdroj včetně paginace.
+    Returns (items, warnings)
+    """
     warnings = []
     items: list[Item] = []
-
-    for page_url in src.get("urls", []):
-        listing_html, err = safe_fetch(page_url, timeout=30)
-        if not listing_html:
-            warnings.append(f"{src['label']}: nepodařilo se stáhnout ({err})")
-            continue
-
-        base = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
-        candidates = extract_candidate_urls(listing_html, base, src)
-
-        # For Kickstarter discover pages, many links are duplicates; keep a smaller set
-        candidates = candidates[:PER_SOURCE_ITEM_CAP]
-
-        for u in candidates:
+    seen_urls: set[str] = set()  # Pro deduplikaci napříč stránkami
+    
+    pagination_config = src.get("pagination", {"type": "none"})
+    pag_type = pagination_config.get("type", "none")
+    start_page = pagination_config.get("start", 1)
+    max_pages = pagination_config.get("max_pages", 1)
+    
+    if pag_type == "none":
+        max_pages = 1
+    
+    for base_url in src.get("urls", []):
+        base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+        
+        for page_num in range(start_page, start_page + max_pages):
+            # Už máme dost položek?
             if len(items) >= PER_SOURCE_ITEM_CAP:
                 break
-            it = build_item_from_product_page(u, src)
-            if it:
-                items.append(it)
+            
+            page_url = build_paginated_url(base_url, page_num, pagination_config)
+            
+            if page_num > start_page:
+                log.info(f"      Stránka {page_num}: {page_url}")
+            
+            listing_html, err = safe_fetch(page_url, timeout=30)
+            if not listing_html:
+                if page_num == start_page:
+                    warnings.append(f"{src['label']}: nepodařilo se stáhnout ({err})")
+                # Pokud další stránka selže, možná už neexistuje
+                break
+            
+            candidates = extract_candidate_urls(listing_html, base, src)
+            
+            # Filtrujeme URL, které jsme už viděli
+            new_candidates = [u for u in candidates if u not in seen_urls]
+            
+            # Pokud na stránce nejsou žádné nové produkty, končíme
+            if not new_candidates and page_num > start_page:
+                log.info(f"      Stránka {page_num}: žádné nové produkty, končím paginaci")
+                break
+            
+            seen_urls.update(new_candidates)
+            
+            # Omezíme počet URL na stránku
+            new_candidates = new_candidates[:PER_PAGE_URL_CAP]
+            
+            page_items_count = 0
+            for u in new_candidates:
+                if len(items) >= PER_SOURCE_ITEM_CAP:
+                    break
+                it = build_item_from_product_page(u, src)
+                if it:
+                    items.append(it)
+                    page_items_count += 1
+            
+            if page_num > start_page:
+                log.info(f"      → {page_items_count} položek")
+            
+            # Pokud stránka vrátila málo položek, možná už další nemá smysl
+            if page_items_count < 5 and page_num > start_page:
+                log.info(f"      Málo položek na stránce {page_num}, končím paginaci")
+                break
 
     # dedupe inside source by title norm
     out, seen = [], set()
@@ -555,7 +657,7 @@ def merge_dedupe_items(items: list[Item]) -> list[Item]:
 
 
 # =============================================================================
-# VYLEPŠENÁ LOGIKA PRO ROZŠÍŘENÍ (v6)
+# VYLEPŠENÁ LOGIKA PRO ROZŠÍŘENÍ (v6+)
 # =============================================================================
 
 def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: list[str]) -> tuple[str, str] | None:
@@ -1043,7 +1145,7 @@ def main():
     if missing:
         raise RuntimeError(f"Missing env vars: {missing}")
 
-    log.info("🚀 Spouštím Deskovkový briefing v6...")
+    log.info("🚀 Spouštím Deskovkový briefing v7 (s paginací)...")
     
     owned = load_collection_titles(COLLECTION_CSV_URL)
     log.info(f"📚 Načteno {len(owned)} vlastněných her")
@@ -1058,9 +1160,14 @@ def main():
     warnings = []
 
     for src in sources:
-        log.info(f"   Scrapuji: {src['label']}...")
+        pag_info = ""
+        pag_config = src.get("pagination", {})
+        if pag_config.get("type") not in (None, "none"):
+            pag_info = f" (max {pag_config.get('max_pages', 1)} stránek)"
+        
+        log.info(f"   Scrapuji: {src['label']}{pag_info}...")
         items, warns = scrape_source(src)
-        log.info(f"   → {len(items)} položek")
+        log.info(f"   → {len(items)} položek celkem")
         all_items.extend(items)
         warnings.extend(warns)
 
