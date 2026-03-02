@@ -1,14 +1,12 @@
-# agent.py (v7) — CZ vydavatelé + Kickstarter + Kolekce + Skupina + AI TOP + PAGINACE
+# agent.py (v10) — CZ vydavatelé + Kickstarter + Kolekce + Skupina + AI TOP + PAGINACE
 # - čte sources.yaml s paginační konfigurací
 # - deduplikuje hry napříč zdroji (preferuje TLAMA link, když existuje)
 # - AI TOP tipy napříč všemi CZ + crowdfunding (oddělené sekce v mailu)
 # - TOP tipy se neukazují podruhé v dalších seznamech
 #
-# v7 ZMĚNY:
-# - Podpora paginace pro katalogy (TLAMA, Rexhry, Albi, ...)
-# - Konfigurace paginace v sources.yaml (type, param, start, max_pages)
-# - Lepší logování průběhu scrapování
-# - Zvýšený celkový limit položek pro katalogy
+# v10 ZMĚNY:
+# - Opravená paginace pro TLAMA: /strana-2/, /strana-3/ atd. (type: path_custom)
+# - Nový pattern v sources.yaml: pattern: "strana-{page}"
 
 import os
 import re
@@ -61,34 +59,94 @@ def _int_env(key: str, default: int) -> int:
     val = os.environ.get(key, "").strip()
     return int(val) if val else default
 
-AI_SCORE_LIMIT_CZ = _int_env("AI_SCORE_LIMIT_CZ", 10)  # kolik CZ kandidátů skórovat AI
-AI_SCORE_LIMIT_CF = _int_env("AI_SCORE_LIMIT_CF", 6)   # kolik crowdfunding kandidátů skórovat AI
-AI_TOP_N_CZ = _int_env("AI_TOP_N_CZ", 3)              # kolik TOP CZ tipů zobrazit
-AI_TOP_N_CF = _int_env("AI_TOP_N_CF", 2)              # kolik TOP crowdfunding tipů zobrazit
+AI_SCORE_LIMIT_CZ = _int_env("AI_SCORE_LIMIT_CZ", 10)
+AI_SCORE_LIMIT_CF = _int_env("AI_SCORE_LIMIT_CF", 6)
+AI_TOP_N_CZ = _int_env("AI_TOP_N_CZ", 3)
+AI_TOP_N_CF = _int_env("AI_TOP_N_CF", 2)
 
-# how many items to collect from each source (across all pages)
-PER_SOURCE_ITEM_CAP = _int_env("PER_SOURCE_ITEM_CAP", 60)
+PER_SOURCE_ITEM_CAP = _int_env("PER_SOURCE_ITEM_CAP", 80)
+PER_PAGE_URL_CAP = _int_env("PER_PAGE_URL_CAP", 50)
 
-# how many product URLs to try per single listing page
-PER_PAGE_URL_CAP = _int_env("PER_PAGE_URL_CAP", 40)
+# === TITLE CLEANING ===
+# Suffixes to remove from titles - order matters (more specific first)
+TITLE_SUFFIXES_TO_REMOVE = [
+    # TLAMA variants
+    r"\s*-\s*TLAMA\s*games?\s*$",
+    r"\s*\|\s*TLAMA\s*games?\s*$",
+    r"\s*–\s*TLAMA\s*games?\s*$",
+    r"\s*—\s*TLAMA\s*games?\s*$",
+    r"\s+TLAMA\s*games?\s*$",
+    # Rexhry
+    r"\s*-\s*Rexhry\.cz\s*$",
+    r"\s*-\s*Rexhry\s*$",
+    r"\s*\|\s*Rexhry\s*$",
+    # Albi
+    r"\s*-\s*Albi\.cz\s*$",
+    r"\s*-\s*Albi\s*$",
+    r"\s*\|\s*Albi\s*$",
+    # MindOK
+    r"\s*-\s*MindOK\.cz\s*$",
+    r"\s*-\s*MindOK\s*$",
+    r"\s*\|\s*MindOK\s*$",
+    # Asmodee
+    r"\s*-\s*Asmodee\s*CZ\s*$",
+    r"\s*-\s*Asmodee\s*$",
+    r"\s*\|\s*Asmodee\s*$",
+    # Blackfire
+    r"\s*-\s*Blackfire\.cz\s*$",
+    r"\s*-\s*Blackfire\s*$",
+    r"\s*\|\s*Blackfire\s*$",
+    # Generic
+    r"\s*-\s*[Dd]eskov[ée]\s*hry\s*$",
+    r"\s*\|\s*[Dd]eskov[ée]\s*hry\s*$",
+    r"\s*-\s*[Ss]polečensk[ée]\s*hry\s*$",
+    r"\s*-\s*Obchod\s*$",
+    r"\s*-\s*E-?shop\s*$",
+]
+
+def clean_title(title: str) -> str:
+    """Remove common e-shop suffixes from titles."""
+    if not title:
+        return title
+    result = title.strip()
+    # Apply each pattern - may need multiple passes
+    changed = True
+    iterations = 0
+    while changed and iterations < 5:
+        changed = False
+        iterations += 1
+        for pattern in TITLE_SUFFIXES_TO_REMOVE:
+            new_result = re.sub(pattern, "", result, flags=re.IGNORECASE)
+            if new_result != result:
+                result = new_result.strip()
+                changed = True
+    return result.strip()
+
 
 # === expansion detection ===
 EXPANSION_KEYWORDS = [
     "rozšíření", "rozsireni", "expanze", "expansion", "extension",
-    "doplněk", "doplnok", "dodatek", "promo", "promo pack",
-    "balíček", "balicek", "pack",
+    "doplněk", "doplnok", "dodatek", 
+    "promo pack", "promo karty", "promo karta",
+    "balíček", "balicek",
 ]
 
-# titles we never want to show as games
+EXPANSION_KEYWORDS_TITLE_ONLY = ["promo"]
+
 TITLE_BLACKLIST_CONTAINS = [
     "registrace", "zapomenuté heslo", "přihlásit", "prihlasit", "košík", "kosik",
     "doprava", "platba", "obchodní podmínky", "podmínky", "ochrany osobních údajů",
     "gdpr", "cookies", "věrnostní", "affiliate", "program", "kontakt", "půjčovna",
     "provozní řád", "rozcesnik", "čestina", "english", "language", "tel:",
-    "facebook", "instagram",
+    "facebook", "instagram", "nejširší nabídka", "vítejte", "homepage",
+    "novinky v češtině", "předprodej", "připravujeme", "ediční plán",
+    "katalog her", "všechny hry", "všechny produkty", "produkty",
 ]
 
-TITLE_BLACKLIST_EXACT = {"deskové hry", "deskove hry"}
+TITLE_BLACKLIST_EXACT = {
+    "deskové hry", "deskove hry", "hry", "produkty", "novinky", 
+    "předprodej", "pripravujeme", "katalog",
+}
 
 
 def norm(s: str) -> str:
@@ -107,21 +165,20 @@ def title_is_ok(title: str) -> bool:
         return False
     if any(norm(b) in t for b in TITLE_BLACKLIST_CONTAINS):
         return False
-    # ignore pure price / numbers
     if re.fullmatch(r"[\d\+\s\-\(\)\.,%]+", title.strip()):
         return False
     return True
 
 
 def looks_like_expansion(title: str, blurb: str = "") -> bool:
-    """
-    Kontroluje, zda produkt vypadá jako rozšíření.
-    Hledá klíčová slova v názvu NEBO v popisu (blurb).
-    """
     t = norm(title)
     b = norm(blurb)
     combined = t + " " + b
-    return any(norm(k) in combined for k in EXPANSION_KEYWORDS)
+    if any(norm(k) in combined for k in EXPANSION_KEYWORDS):
+        return True
+    if any(norm(k) in t for k in EXPANSION_KEYWORDS_TITLE_ONLY):
+        return True
+    return False
 
 
 def fetch(url: str, *, timeout: int = 30) -> str:
@@ -135,7 +192,6 @@ def fetch(url: str, *, timeout: int = 30) -> str:
 
 
 def safe_fetch(url: str, *, timeout: int = 30) -> tuple[str | None, str | None]:
-    """Returns (html, error_string)"""
     try:
         return fetch(url, timeout=timeout), None
     except Exception as e:
@@ -156,16 +212,12 @@ def absolute_url(base: str, href: str) -> str:
 
 
 def extract_image_url(soup: BeautifulSoup, base: str) -> str:
-    # meta first (most reliable)
     og_img = soup.find("meta", attrs={"property": "og:image"})
     if og_img and og_img.get("content"):
         return absolute_url(base, og_img["content"].strip())
-
     tw_img = soup.find("meta", attrs={"name": "twitter:image"})
     if tw_img and tw_img.get("content"):
         return absolute_url(base, tw_img["content"].strip())
-
-    # fallback: first meaningful img
     img = soup.find("img")
     if img:
         for attr in ["src", "data-src", "data-original", "data-lazy", "data-image"]:
@@ -178,17 +230,16 @@ def extract_image_url(soup: BeautifulSoup, base: str) -> str:
 def extract_title_from_page(soup: BeautifulSoup) -> str:
     og_title = soup.find("meta", attrs={"property": "og:title"})
     if og_title and og_title.get("content"):
-        return " ".join(og_title["content"].split()).strip()
-
+        raw = " ".join(og_title["content"].split()).strip()
+        return clean_title(raw)
     h1 = soup.find("h1")
     if h1:
         t = " ".join(h1.get_text(" ", strip=True).split()).strip()
         if t:
-            return t
-
+            return clean_title(t)
     if soup.title and soup.title.string:
-        return " ".join(str(soup.title.string).split()).strip()
-
+        raw = " ".join(str(soup.title.string).split()).strip()
+        return clean_title(raw)
     return ""
 
 
@@ -196,11 +247,9 @@ def extract_blurb_from_page(soup: BeautifulSoup) -> str:
     og = soup.find("meta", attrs={"property": "og:description"})
     if og and og.get("content"):
         return " ".join(og["content"].split())[:700]
-
     desc = soup.find("meta", attrs={"name": "description"})
     if desc and desc.get("content"):
         return " ".join(desc["content"].split())[:700]
-
     text = soup.get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text)
     return text[:700]
@@ -212,7 +261,6 @@ def is_jsonld_product(soup: BeautifulSoup) -> bool:
             data = json.loads(tag.get_text(strip=True) or "{}")
         except Exception:
             continue
-
         candidates = data if isinstance(data, list) else [data]
         for obj in candidates:
             if not isinstance(obj, dict):
@@ -232,14 +280,14 @@ class Item:
     image_url: str
     source_id: str
     source_label: str
-    kind: str               # "cz" or "crowdfunding"
+    kind: str
     priority: int
-    blurb: str = ""         # short text from product page
-    matched_base_game: str = ""  # pro rozšíření: název základní hry, ke které patří
+    blurb: str = ""
+    matched_base_game: str = ""
 
 
 def load_csv_rows(csv_url: str) -> list[list[str]]:
-    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/7.0"})
+    r = requests.get(csv_url, timeout=30, headers={"User-Agent": "DeskovkyAgent/9.0"})
     r.raise_for_status()
     raw = r.text.lstrip("\ufeff")
     reader = csv.reader(io.StringIO(raw))
@@ -256,14 +304,12 @@ def load_collection_titles(csv_url: str) -> list[str]:
         if norm(h) == "titul":
             col_idx = i
             break
-
     titles = []
     for row in rows[1:]:
         if col_idx < len(row):
             t = row[col_idx].strip()
             if t:
                 titles.append(t)
-
     out, seen = [], set()
     for t in titles:
         nt = norm(t)
@@ -277,7 +323,6 @@ def load_group_profile(csv_url: str) -> tuple[dict, dict]:
     rows = load_csv_rows(csv_url)
     if not rows:
         return {}, {}
-
     header = rows[0]
     kdo_idx = 0
     popis_idx = 1 if len(header) > 1 else 0
@@ -286,7 +331,6 @@ def load_group_profile(csv_url: str) -> tuple[dict, dict]:
             kdo_idx = i
         if norm(h) == "popis":
             popis_idx = i
-
     people = {}
     meta = {}
     for row in rows[1:]:
@@ -296,14 +340,12 @@ def load_group_profile(csv_url: str) -> tuple[dict, dict]:
         if not kdo:
             continue
         popis = row[popis_idx].strip() if popis_idx < len(row) else ""
-
         k_norm = norm(kdo)
         if "_" in k_norm or k_norm in {"players", "avoid_dice_heavy", "session_length"}:
             meta[k_norm] = popis.strip() if popis else ""
         else:
             if popis:
                 people[kdo.strip()] = popis.strip()
-
     return people, meta
 
 
@@ -316,10 +358,8 @@ def summarize_group_for_prompt(people: dict, meta: dict) -> str:
     if meta.get("session_length"):
         parts.append(f"- Délka sezení (realita): {meta.get('session_length')}")
     meta_block = "\n".join(parts).strip()
-
     people_lines = [f"{name}: {profile}" for name, profile in people.items()]
     people_block = "\n".join(people_lines).strip()
-
     out = []
     if meta_block:
         out.append("META:\n" + meta_block)
@@ -338,7 +378,6 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "Poznámky vybírej podle relevance (nemusí být pro všechny, ale ať to není pořád jen pro stejné dva). "
         "Pokud hra výrazně stojí na náhodě/kostkách, uveď varování."
     )
-
     input_payload = (
         f"### PROFIL SKUPINY\n{group_text}\n\n"
         f"### HRA\nNázev: {game_title}\n"
@@ -358,13 +397,11 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         "- notes: dej 2 až 4 položky, who musí být JEN z: Honza, Káťa, Monča, Šimon.\n"
         "- warnings max 2 položky."
     )
-
     resp = client.responses.create(
         model=OPENAI_MODEL,
         instructions=instructions,
         input=input_payload,
     )
-
     raw = (resp.output_text or "").strip()
     try:
         data = json.loads(raw)
@@ -373,19 +410,15 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         if not m:
             return {"fit": 0, "why": ["AI odpověď nešla přečíst."], "notes": [], "warnings": ["AI output mimo JSON"]}
         data = json.loads(m.group(0))
-
     try:
         fit = int(data.get("fit", 0))
     except Exception:
         fit = 0
     fit = max(0, min(100, fit))
-
     why = data.get("why", [])
     if not isinstance(why, list):
         why = []
     why = [str(x) for x in why][:2]
-
-    # notes validation/sanitization
     allowed_people = {"Honza", "Káťa", "Monča", "Šimon"}
     notes = data.get("notes", [])
     out_notes = []
@@ -397,7 +430,6 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
             note = str(n.get("note", "")).strip()
             if who in allowed_people and note:
                 out_notes.append({"who": who, "note": note})
-    # cap + ensure unique who order
     seen_who = set()
     dedup_notes = []
     for n in out_notes:
@@ -406,12 +438,10 @@ def ai_fit_score(client: OpenAI, group_text: str, game_title: str, game_blurb: s
         seen_who.add(n["who"])
         dedup_notes.append(n)
     notes = dedup_notes[:4]
-
     warnings = data.get("warnings", [])
     if not isinstance(warnings, list):
         warnings = []
     warnings = [str(x) for x in warnings][:2]
-
     return {"fit": fit, "why": why, "notes": notes, "warnings": warnings}
 
 
@@ -426,26 +456,21 @@ def url_allowed(url: str, src: dict) -> bool:
         p = urlparse(url)
     except Exception:
         return False
-
     allow_domains = set(src.get("allow_domains", []))
     if allow_domains and p.netloc not in allow_domains:
         return False
-
     must_contain = src.get("product_url_must_contain", [])
     for part in must_contain:
         if part and part not in url:
             return False
-
     must_contain_any = src.get("product_url_must_contain_any", [])
     if must_contain_any:
         if not any(part in url for part in must_contain_any if part):
             return False
-
     must_not = src.get("product_url_must_not_contain", [])
     for part in must_not:
         if part and part in url:
             return False
-
     return True
 
 
@@ -453,7 +478,6 @@ def extract_candidate_urls(listing_html: str, base_url: str, src: dict) -> list[
     soup = BeautifulSoup(listing_html, "html.parser")
     out = []
     seen = set()
-
     for a in soup.find_all("a", href=True):
         u = absolute_url(base_url, a.get("href", ""))
         if not u:
@@ -463,34 +487,23 @@ def extract_candidate_urls(listing_html: str, base_url: str, src: dict) -> list[
         seen.add(u)
         if url_allowed(u, src):
             out.append(u)
-
-    return out[:PER_PAGE_URL_CAP * 2]  # loose cap pre-filter
+    return out[:PER_PAGE_URL_CAP * 2]
 
 
 def build_item_from_product_page(url: str, src: dict) -> Item | None:
     html_text, err = safe_fetch(url, timeout=30)
     if not html_text:
         return None
-
     soup = BeautifulSoup(html_text, "html.parser")
-
-    # Heuristic: product pages usually have og:title/og:image or Product JSON-LD
     title = extract_title_from_page(soup)
     if not title or not title_is_ok(title):
         return None
-
-    # additional heuristics to reduce garbage
-    # - if no og:image AND no Product jsonld and title looks like navigation => drop
     if not soup.find("meta", attrs={"property": "og:image"}) and not is_jsonld_product(soup):
-        # keep Kickstarter anyway (project pages)
         if src.get("kind") != "crowdfunding":
-            # still allow if URL clearly looks like product and title ok
             pass
-
     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
     image_url = extract_image_url(soup, base)
     blurb = extract_blurb_from_page(soup)
-
     return Item(
         title=title.strip(),
         url=url,
@@ -504,146 +517,97 @@ def build_item_from_product_page(url: str, src: dict) -> Item | None:
 
 
 # =============================================================================
-# PAGINACE (v7)
+# PAGINACE
 # =============================================================================
 
 def build_paginated_url(base_url: str, page_num: int, pagination_config: dict) -> str:
-    """
-    Sestaví URL pro danou stránku podle konfigurace paginace.
-    
-    Podporované typy:
-    - query_param: přidá ?param=page_num (např. ?page=2)
-    - path: přidá /page/page_num na konec URL
-    - none: vrátí původní URL
-    """
     pag_type = pagination_config.get("type", "none")
+    start_page = pagination_config.get("start", 1)
     
-    if pag_type == "none" or page_num <= pagination_config.get("start", 1):
-        # První stránka = původní URL
+    if pag_type == "none" or page_num <= start_page:
         return base_url
     
     if pag_type == "query_param":
         param_name = pagination_config.get("param", "page")
-        
-        # Parsujeme URL
         parsed = urlparse(base_url)
-        
-        # Získáme existující query parametry
         existing_params = parse_qs(parsed.query)
-        
-        # Přidáme/přepíšeme page parametr
         existing_params[param_name] = [str(page_num)]
-        
-        # Sestavíme nový query string
         new_query = urlencode(existing_params, doseq=True)
-        
-        # Sestavíme novou URL
         new_url = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            new_query,
-            parsed.fragment
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, new_query, parsed.fragment
         ))
         return new_url
     
     if pag_type == "path":
-        # Přidáme /page/X na konec
         clean_base = base_url.rstrip("/")
         return f"{clean_base}/page/{page_num}"
     
-    # Neznámý typ = původní URL
+    if pag_type == "path_custom":
+        # Custom path pattern, e.g. "strana-{page}" -> /strana-2/
+        pattern = pagination_config.get("pattern", "page-{page}")
+        slug = pattern.replace("{page}", str(page_num))
+        clean_base = base_url.rstrip("/")
+        return f"{clean_base}/{slug}/"
+    
     return base_url
 
 
 def scrape_source(src: dict) -> tuple[list[Item], list[str]]:
-    """
-    Scrapuje zdroj včetně paginace.
-    Returns (items, warnings)
-    """
     warnings = []
     items: list[Item] = []
-    seen_urls: set[str] = set()  # Pro deduplikaci napříč stránkami
-    
+    seen_titles: set[str] = set()
     pagination_config = src.get("pagination", {"type": "none"})
     pag_type = pagination_config.get("type", "none")
     start_page = pagination_config.get("start", 1)
     max_pages = pagination_config.get("max_pages", 1)
-    
     if pag_type == "none":
         max_pages = 1
-    
+    consecutive_empty_pages = 0
     for base_url in src.get("urls", []):
         base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-        
         for page_num in range(start_page, start_page + max_pages):
-            # Už máme dost položek?
             if len(items) >= PER_SOURCE_ITEM_CAP:
+                log.info(f"      Dosažen limit {PER_SOURCE_ITEM_CAP} položek, končím")
                 break
-            
+            if consecutive_empty_pages >= 2:
+                log.info(f"      {consecutive_empty_pages} prázdné stránky v řadě, končím paginaci")
+                break
             page_url = build_paginated_url(base_url, page_num, pagination_config)
-            
             if page_num > start_page:
                 log.info(f"      Stránka {page_num}: {page_url}")
-            
             listing_html, err = safe_fetch(page_url, timeout=30)
             if not listing_html:
                 if page_num == start_page:
                     warnings.append(f"{src['label']}: nepodařilo se stáhnout ({err})")
-                # Pokud další stránka selže, možná už neexistuje
+                else:
+                    log.info(f"      Stránka {page_num} se nepodařila stáhnout, končím")
                 break
-            
             candidates = extract_candidate_urls(listing_html, base, src)
-            
-            # Filtrujeme URL, které jsme už viděli
-            new_candidates = [u for u in candidates if u not in seen_urls]
-            
-            # Pokud na stránce nejsou žádné nové produkty, končíme
-            if not new_candidates and page_num > start_page:
-                log.info(f"      Stránka {page_num}: žádné nové produkty, končím paginaci")
-                break
-            
-            seen_urls.update(new_candidates)
-            
-            # Omezíme počet URL na stránku
-            new_candidates = new_candidates[:PER_PAGE_URL_CAP]
-            
+            candidates = candidates[:PER_PAGE_URL_CAP]
             page_items_count = 0
-            for u in new_candidates:
+            for u in candidates:
                 if len(items) >= PER_SOURCE_ITEM_CAP:
                     break
                 it = build_item_from_product_page(u, src)
-                if it:
-                    items.append(it)
-                    page_items_count += 1
-            
+                if not it:
+                    continue
+                title_key = norm(it.title)
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
+                items.append(it)
+                page_items_count += 1
             if page_num > start_page:
-                log.info(f"      → {page_items_count} položek")
-            
-            # Pokud stránka vrátila málo položek, možná už další nemá smysl
-            if page_items_count < 5 and page_num > start_page:
-                log.info(f"      Málo položek na stránce {page_num}, končím paginaci")
-                break
-
-    # dedupe inside source by title norm
-    out, seen = [], set()
-    for it in items:
-        nt = norm(it.title)
-        if nt in seen:
-            continue
-        seen.add(nt)
-        out.append(it)
-
-    return out[:PER_SOURCE_ITEM_CAP], warnings
+                log.info(f"      → {page_items_count} nových položek")
+            if page_items_count == 0:
+                consecutive_empty_pages += 1
+            else:
+                consecutive_empty_pages = 0
+    return items[:PER_SOURCE_ITEM_CAP], warnings
 
 
 def merge_dedupe_items(items: list[Item]) -> list[Item]:
-    """
-    Dedupe by normalized title.
-    If multiple sources have same title, keep the one with lowest priority number
-    (TLAMA should have lower numbers in config).
-    """
     best: dict[str, Item] = {}
     for it in items:
         key = norm(it.title)
@@ -657,27 +621,24 @@ def merge_dedupe_items(items: list[Item]) -> list[Item]:
 
 
 # =============================================================================
-# VYLEPŠENÁ LOGIKA PRO ROZŠÍŘENÍ (v6+)
+# ROZŠÍŘENÍ - v9: ODSTRANĚN MAIN_WORD MATCH (příliš nespolehlivý)
 # =============================================================================
 
 def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: list[str]) -> tuple[str, str] | None:
     """
     Vrací (název_vlastněné_hry, typ_matche) nebo None.
     
-    typ_matche: "prefix_colon" | "full" | "prefix3" | "prefix2" | "main_word"
+    v9: ODSTRANĚN MAIN_WORD match - generoval false positives jako:
+        "Galaxy Trucker" → "Star wars rule the galaxy" (shoda na "galaxy")
     
-    PRIORITA MATCHŮ (nižší = lepší):
-    1. PREFIX_COLON - produkt ZAČÍNÁ názvem hry + dvojtečka/pomlčka (nejspolehlivější!)
-       Např. "Na křídlech draků: Ohnivá akademie" → "Na křídlech draků"
-    2. FULL match - celý název hry je někde v názvu produktu
-    3. PREFIX3/PREFIX2 - první 2-3 slova (vyžaduje klíčové slovo)
-    4. MAIN_WORD - hlavní slovo (vyžaduje klíčové slovo)
+    Nyní podporované matche:
+    1. PREFIX_COLON - produkt ZAČÍNÁ názvem hry + ":" nebo " -" (nejspolehlivější)
+    2. FULL match - celý název hry je v názvu produktu
+    3. PREFIX3 - první 3 slova názvu hry (min 12 znaků)
     
-    Při stejné prioritě se preferuje delší název vlastněné hry.
+    PREFIX2 byl taky odstraněn - příliš krátký pro spolehlivý match.
     """
     t = norm(title)
-    
-    # Sbíráme všechny matche: (priorita, délka_názvu, orig_title, match_type_str)
     matches: list[tuple[int, int, str, str]] = []
     
     for orig_title, game_nt in zip(owned_titles, owned_norm):
@@ -686,52 +647,34 @@ def match_expansion_to_owned(title: str, owned_titles: list[str], owned_norm: li
         
         words = game_nt.split()
         
-        # 1. PREFIX_COLON - produkt ZAČÍNÁ názvem hry + ":" nebo " -" nebo " –"
-        #    Tohle je nejspolehlivější pattern pro rozšíření!
-        #    "Na křídlech draků: Ohnivá akademie" začíná "na kridlech draku:"
+        # 1. PREFIX_COLON - produkt ZAČÍNÁ názvem hry + separator
         for separator in [":", " -", " –", " —"]:
-            if t.startswith(game_nt + separator.lower()) or t.startswith(game_nt + separator):
+            check = game_nt + separator.lower()
+            if t.startswith(check) or t.startswith(game_nt + separator):
                 matches.append((0, len(game_nt), orig_title, "prefix_colon"))
                 break
         else:
-            # 2. FULL match - celý název hry je v názvu rozšíření (priorita 1)
+            # 2. FULL match - celý název hry je v názvu produktu
             if game_nt in t:
                 matches.append((1, len(game_nt), orig_title, "full"))
                 continue
             
-            # 3. PREFIX3 match - první 3 slova (priorita 2)
+            # 3. PREFIX3 match - první 3 slova (min 12 znaků pro spolehlivost)
             if len(words) >= 3:
                 prefix3 = " ".join(words[:3])
-                if len(prefix3) >= 10 and prefix3 in t:
+                if len(prefix3) >= 12 and prefix3 in t:
                     matches.append((2, len(prefix3), orig_title, "prefix3"))
                     continue
             
-            # 4. PREFIX2 match - první 2 slova (priorita 3)
-            if len(words) >= 2:
-                prefix2 = " ".join(words[:2])
-                if len(prefix2) >= 8 and prefix2 in t:
-                    matches.append((3, len(prefix2), orig_title, "prefix2"))
-                    continue
-            
-            # 5. MAIN_WORD match - nejdelší slovo (priorita 4)
-            if len(words) >= 1:
-                main_word = max(words, key=len)
-                if len(main_word) >= 6 and main_word in t:
-                    generic_words = {"hry", "hra", "game", "games", "edition", "edice", "deluxe", "board", "card", "dice", "the"}
-                    if main_word not in generic_words:
-                        matches.append((4, len(main_word), orig_title, "main_word"))
+            # MAIN_WORD a PREFIX2 ODSTRANĚNY - příliš nespolehlivé
     
     if not matches:
         return None
     
-    # Seřadíme: nejdřív podle priority (nižší = lepší), pak podle délky (delší = lepší)
     matches.sort(key=lambda x: (x[0], -x[1]))
-    
     best = matches[0]
     priority, length, orig_title, match_type = best
-    
-    log.debug(f"  Match [{match_type}]: '{orig_title}' pro '{title}' (priorita {priority}, délka {length})")
-    
+    log.debug(f"  Match [{match_type}]: '{orig_title}' pro '{title}'")
     return (orig_title, match_type)
 
 
@@ -747,14 +690,6 @@ def categorize_item(
       - "expansion_for_owned" = rozšíření pro hru, kterou vlastníme
       - "expansion_other" = rozšíření, ale ne pro naši hru
       - "new_game" = nová hra (ne rozšíření)
-    
-    matched_game: název základní hry (jen pro expansion_for_owned)
-    
-    DŮLEŽITÉ: Aby se produkt označil jako rozšíření pro vlastněnou hru, musí:
-    - FULL match: celý název hry je v názvu produktu → vždy OK
-    - PARTIAL match: jen část názvu → vyžaduje klíčové slovo (rozšíření, expansion, ...)
-    
-    Klíčová slova se hledají v názvu I v popisu (blurb).
     """
     is_expansion_by_keyword = looks_like_expansion(item.title, item.blurb)
     match_result = match_expansion_to_owned(item.title, owned_titles, owned_norm)
@@ -763,34 +698,18 @@ def categorize_item(
         matched_game, match_type = match_result
         matched_game_len = len(norm(matched_game))
         
-        # SPOLEHLIVÉ MATCHE (nevyžadují klíčové slovo):
-        # - prefix_colon: "Na křídlech draků: Ohnivá akademie" začíná "Na křídlech draků:"
-        # - full: celý název hry je v produktu
-        #
-        # ALE: krátké názvy (< 8 znaků) jako "Duna", "Catan" atd. 
-        # můžou mít podtituly i u samostatných her ("Duna: Tajemství rodu")
-        # → u krátkých názvů VŽDY vyžadujeme klíčové slovo
-        #
-        # SLABÉ MATCHE (vždy vyžadují klíčové slovo):
-        # - prefix2, prefix3, main_word
-        
-        is_short_name = matched_game_len < 10  # "Na křídlech" = 10, "Duna" = 4
+        # Krátké názvy (< 10 znaků) jako "Duna", "Catan" vždy vyžadují klíčové slovo
+        is_short_name = matched_game_len < 10
         
         if match_type in ("prefix_colon", "full") and not is_short_name:
-            # Dlouhý název + spolehlivý match = OK
             return ("expansion_for_owned", matched_game)
         elif is_expansion_by_keyword:
-            # Krátký název nebo slabý match, ale máme klíčové slovo = OK
             return ("expansion_for_owned", matched_game)
         else:
-            # Krátký název bez klíčového slova = ignorujeme (možná samostatná hra)
             if is_short_name:
                 log.debug(f"   Krátký název bez klíčového slova: '{item.title}' ~> '{matched_game}'")
-            else:
-                log.debug(f"   Partial match bez klíčového slova: '{item.title}' ~> '{matched_game}'")
     
     if is_expansion_by_keyword:
-        # Je to rozšíření (podle klíčového slova), ale ne pro naši hru
         return ("expansion_other", None)
     
     return ("new_game", None)
@@ -810,7 +729,6 @@ def build_email(
     
     owned_norm = [norm(t) for t in owned_titles]
     
-    # Debug: logujeme vlastněné hry
     log.info(f"📚 Načteno {len(owned_titles)} vlastněných her z tabulky")
     if owned_titles:
         log.info(f"   Prvních 10 her: {owned_titles[:10]}")
@@ -820,9 +738,8 @@ def build_email(
     
     log.info(f"🔍 Analyzuji {len(cz_items)} CZ položek pro rozšíření...")
     
-    # Debug: vypíšeme všechny CZ položky
-    log.info(f"   Všechny CZ položky:")
-    for it in cz_items[:15]:  # max 15 pro přehlednost
+    log.info(f"   Prvních 15 CZ položek:")
+    for it in cz_items[:15]:
         log.info(f"     - {it.title}")
     
     expansions_for_owned: list[Item] = []
@@ -832,11 +749,10 @@ def build_email(
     for it in cz_items:
         category, matched_game = categorize_item(it, owned_titles, owned_norm)
         
-        # Debug log pro každou položku
         if category == "expansion_for_owned":
             log.info(f"   ✅ '{it.title}' → rozšíření pro '{matched_game}'")
         elif category == "expansion_other":
-            log.info(f"   ⏭️ '{it.title}' → rozšíření, ale ne pro tvou hru")
+            log.debug(f"   ⏭️ '{it.title}' → rozšíření, ale ne pro tvou hru")
         else:
             log.debug(f"   ➡️ '{it.title}' → nová hra")
         
@@ -851,20 +767,16 @@ def build_email(
     log.info(f"📊 Výsledek: {len(expansions_for_owned)} rozšíření pro vlastněné hry, "
              f"{len(new_games_cz)} nových her, {skipped_other_expansions} rozšíření pro jiné hry")
     
-    # separate crowdfunding: no expansion logic, just list
     crowdfunding = cf_items
 
-    # sort CZ: TLAMA-ish first by priority then alpha
     new_games_cz.sort(key=lambda x: (x.priority, norm(x.title)))
     expansions_for_owned.sort(key=lambda x: (x.priority, norm(x.title)))
     crowdfunding.sort(key=lambda x: (x.priority, norm(x.title)))
 
-    # caps
     expansions_for_owned = expansions_for_owned[:12]
     new_games_cz = new_games_cz[:20]
     crowdfunding = crowdfunding[:12]
 
-    # === AI scoring - SEPARÁTNĚ pro CZ a crowdfunding ===
     top_cz_block = []
     top_cf_block = []
     
@@ -872,7 +784,6 @@ def build_email(
         client = OpenAI()
         group_text = summarize_group_for_prompt(people, meta)
 
-        # --- CZ TOP tipy ---
         log.info(f"🤖 AI hodnotí TOP {AI_TOP_N_CZ} z {min(len(new_games_cz), AI_SCORE_LIMIT_CZ)} CZ her...")
         cz_candidates = new_games_cz[:AI_SCORE_LIMIT_CZ]
         cz_scored = []
@@ -886,7 +797,6 @@ def build_email(
         for it, score in cz_scored[:AI_TOP_N_CZ]:
             top_cz_block.append({"item": it, "score": score})
         
-        # --- Crowdfunding TOP tipy ---
         if crowdfunding:
             log.info(f"🤖 AI hodnotí TOP {AI_TOP_N_CF} z {min(len(crowdfunding), AI_SCORE_LIMIT_CF)} crowdfunding her...")
             cf_candidates = crowdfunding[:AI_SCORE_LIMIT_CF]
@@ -898,12 +808,10 @@ def build_email(
                 log.debug(f"   {it.title}: {score.get('fit', 0)}/100")
 
             cf_scored.sort(key=lambda x: x[1].get("fit", 0), reverse=True)
-            # Bereme jen ty s fitem >= 50 (má smysl doporučit)
             for it, score in cf_scored[:AI_TOP_N_CF]:
-                if score.get("fit", 0) >= 40:  # minimální práh pro doporučení
+                if score.get("fit", 0) >= 40:
                     top_cf_block.append({"item": it, "score": score})
 
-    # remove TOP items from lists (no duplicates)
     top_cz_urls = {t["item"].url for t in top_cz_block} if top_cz_block else set()
     top_cf_urls = {t["item"].url for t in top_cf_block} if top_cf_block else set()
     new_games_cz_rest = [it for it in new_games_cz if it.url not in top_cz_urls]
@@ -914,7 +822,6 @@ def build_email(
     lines.append(f"🎲 Deskovkový briefing – {date.today().isoformat()}")
     lines.append("")
 
-    # TOP CZ tipy
     if top_cz_block:
         lines.append("🏆 TOP tipy týdne – CZ novinky (AI fit pro skupinu):")
         for t in top_cz_block:
@@ -923,7 +830,6 @@ def build_email(
             lines.append(f"- {sc['fit']}/100 — {it.title}  ({src})")
             for w in sc.get("why", []):
                 lines.append(f"  • {w}")
-
             notes = sc.get("notes", [])
             if isinstance(notes, list) and notes:
                 for n in notes:
@@ -931,13 +837,11 @@ def build_email(
                     note = n.get("note", "")
                     if who and note:
                         lines.append(f"  • {who}: {note}")
-
             for warn in sc.get("warnings", []):
                 lines.append(f"  ⚠️ {warn}")
             lines.append(f"  {it.url}")
         lines.append("")
 
-    # TOP Crowdfunding tipy
     if top_cf_block:
         lines.append("🚀 TOP tipy z crowdfundingu (AI fit pro skupinu):")
         for t in top_cf_block:
@@ -945,7 +849,6 @@ def build_email(
             lines.append(f"- {sc['fit']}/100 — {it.title} ({it.source_label})")
             for w in sc.get("why", []):
                 lines.append(f"  • {w}")
-
             notes = sc.get("notes", [])
             if isinstance(notes, list) and notes:
                 for n in notes:
@@ -953,7 +856,6 @@ def build_email(
                     note = n.get("note", "")
                     if who and note:
                         lines.append(f"  • {who}: {note}")
-
             for warn in sc.get("warnings", []):
                 lines.append(f"  ⚠️ {warn}")
             lines.append(f"  {it.url}")
@@ -998,14 +900,10 @@ def build_email(
         img = it.image_url or ""
         img_tag = f'<img src="{html.escape(img)}" alt="" style="width:64px;height:auto;border-radius:10px;display:block;">' if img else ""
         left = f'<div style="flex:0 0 64px;">{img_tag}</div>' if img_tag else ""
-        # Zobrazujeme vždy source_label (TLAMA, Kickstarter, Gamefound, ...)
         badge = f'<div style="font-size:12px;color:#9aa0a6;margin-top:2px;">{html.escape(it.source_label)}</div>'
-        
-        # Pro rozšíření zobrazíme, ke které hře patří
         base_game_html = ""
         if show_base_game and it.matched_base_game:
             base_game_html = f'<div style="font-size:12px;color:#81c995;margin-top:2px;">→ pro hru: {html.escape(it.matched_base_game)}</div>'
-        
         return f"""
         <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid #2a2a2a;">
           {left}
@@ -1021,7 +919,6 @@ def build_email(
         </div>
         """
 
-    # Helper pro generování TOP bloků
     def build_top_html_block(top_block: list, title: str) -> str:
         if not top_block:
             return ""
@@ -1030,7 +927,6 @@ def build_email(
             it = t["item"]; sc = t["score"]
             why = sc.get("why", [])
             warns = sc.get("warnings", [])
-
             parts = []
             if why:
                 parts.append(
@@ -1039,8 +935,6 @@ def build_email(
                 )
             else:
                 parts.append(f'<div style="margin:6px 0 0 0;color:#e8eaed;font-size:13px;"><b>{sc["fit"]}/100</b></div>')
-
-            # notes (2–4 people)
             notes = sc.get("notes", [])
             if isinstance(notes, list) and notes:
                 nice = []
@@ -1051,21 +945,14 @@ def build_email(
                         nice.append(f'{html.escape(who)}: {html.escape(note)}')
                 if nice:
                     parts.append(f'<div style="margin:4px 0 0 0;color:#bdc1c6;font-size:12px;">{" | ".join(nice)}</div>')
-
             if warns:
                 parts.append(f'<div style="margin:4px 0 0 0;color:#f28b82;font-size:12px;">⚠️ {html.escape(" • ".join(warns))}</div>')
-
             blocks.append(card(it, extra_html="\n".join(parts)))
-
         return f'<h2 style="font-size:16px;margin:18px 0 8px 0;">{title}</h2>' + "".join(blocks)
 
-    # TOP CZ
     top_cz_html = build_top_html_block(top_cz_block, "🏆 TOP tipy týdne – CZ novinky (AI fit)")
-    
-    # TOP Crowdfunding  
     top_cf_html = build_top_html_block(top_cf_block, "🚀 TOP tipy z crowdfundingu (AI fit)")
 
-    # Rozšíření - s informací o základní hře
     exp_html = "".join(card(it, show_base_game=True) for it in expansions_for_owned) or '<div style="color:#9aa0a6;">(žádná rozšíření pro tvé hry momentálně v nabídce)</div>'
     cz_html = "".join(card(it) for it in new_games_cz_rest) or '<div style="color:#9aa0a6;">(zbytek tento týden pokryl TOP výběr 🙂)</div>'
     cf_html = "".join(card(it) for it in crowdfunding_rest) or '<div style="color:#9aa0a6;">(zatím nic / nebo zdroj zrovna zlobí)</div>'
@@ -1084,22 +971,15 @@ def build_email(
       <div style="color:#bdc1c6;margin:0 0 16px 0;">
         TLAMA držíme jako hlavní zdroj. Když je hra i jinde, bereme TLAMA link. Když TLAMA nemá, bereme ostatní. 🙂
       </div>
-
       {top_cz_html}
-
       {top_cf_html}
-
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🧩 Rozšíření pro hry, které už máš</h2>
       {exp_html}
-
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🇨🇿 Novinky v ČR (TLAMA + ostatní)</h2>
       {cz_html}
-
       <h2 style="font-size:16px;margin:18px 0 8px 0;">🚀 Další na crowdfundingu</h2>
       {cf_html}
-
       {warn_html}
-
       <div style="margin-top:16px;color:#9aa0a6;font-size:12px;">
         Pozn.: některé weby (hlavně crowdfunding) občas mění strukturu / blokují scrapování. Když zlobí, uvidíš to v poznámkách.
       </div>
@@ -1145,7 +1025,7 @@ def main():
     if missing:
         raise RuntimeError(f"Missing env vars: {missing}")
 
-    log.info("🚀 Spouštím Deskovkový briefing v7 (s paginací)...")
+    log.info("🚀 Spouštím Deskovkový briefing v10 (opravená TLAMA paginace)...")
     
     owned = load_collection_titles(COLLECTION_CSV_URL)
     log.info(f"📚 Načteno {len(owned)} vlastněných her")
@@ -1164,14 +1044,12 @@ def main():
         pag_config = src.get("pagination", {})
         if pag_config.get("type") not in (None, "none"):
             pag_info = f" (max {pag_config.get('max_pages', 1)} stránek)"
-        
         log.info(f"   Scrapuji: {src['label']}{pag_info}...")
         items, warns = scrape_source(src)
         log.info(f"   → {len(items)} položek celkem")
         all_items.extend(items)
         warnings.extend(warns)
 
-    # global dedupe + TLAMA preference by priority
     all_items = merge_dedupe_items(all_items)
     log.info(f"📦 Celkem {len(all_items)} unikátních položek po deduplikaci")
 
