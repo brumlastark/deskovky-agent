@@ -20,12 +20,12 @@ sources:
       - "/action/language"
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
-    # Novinky jsou obvykle na 1-2 stránkách
+      - "/strana-"
     pagination:
-      type: query_param
-      param: page
+      type: path_custom
+      pattern: "strana-{page}"
       start: 1
-      max_pages: 2
+      max_pages: 3
 
   - id: tlama_predprodej
     label: TLAMA – Předprodej
@@ -46,13 +46,14 @@ sources:
       - "/action/language"
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
+      - "/strana-"
     pagination:
-      type: query_param
-      param: page
+      type: path_custom
+      pattern: "strana-{page}"
       start: 1
-      max_pages: 2
+      max_pages: 3
 
-  # Katalog pro zachycení rozšíření, která jsou už skladem
+  # Katalog - hlavní zdroj pro rozšíření
   - id: tlama_katalog
     label: TLAMA – Katalog
     kind: cz
@@ -72,12 +73,13 @@ sources:
       - "/action/language"
       - "/deskove-hry/encyklopedie"
       - "/deskove-hry/deskove-hry"
-    # Katalog má hodně stránek - procházíme více pro rozšíření
+      - "/strana-"
+    # TLAMA používá /strana-2/, /strana-3/ atd.
     pagination:
-      type: query_param
-      param: page
+      type: path_custom
+      pattern: "strana-{page}"
       start: 1
-      max_pages: 20
+      max_pages: 15
 
   - id: rexhry_katalog
     label: Rexhry – Katalog (nejnovější)
@@ -112,7 +114,6 @@ sources:
       - "/produkt/"
       - "/hra/"
       - "/hry/"
-    # Připravujeme je obvykle krátký seznam
     pagination:
       type: none
 
@@ -212,9 +213,6 @@ sources:
       type: none
 
   # === Crowdfunding ===
-  # Poznámka: Kickstarter a Gamefound používají JavaScript pro načítání obsahu,
-  # paginace přes URL nefunguje spolehlivě. Bereme jen první stránku.
-  
   - id: kickstarter_tabletop
     label: Kickstarter
     kind: crowdfunding
